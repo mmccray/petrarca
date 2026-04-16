@@ -376,6 +376,37 @@ CREATE TABLE IF NOT EXISTS knowledge_items (
     UNIQUE(curriculum_domain, curriculum_node_id)
 );
 
+-- Entity-keyed knowledge items — parallel to knowledge_items but anchored on
+-- entities (people, places, events) instead of curriculum nodes. Used when
+-- voice captures can't route to existing curricula. Same FSRS scheduling,
+-- same key_facts schema, same cached_question flow. See
+-- research/entity-first-architecture.md.
+CREATE TABLE IF NOT EXISTS knowledge_entities (
+    id TEXT PRIMARY KEY,                    -- 'ent:{slug}'
+    entity_id TEXT,                         -- FK shared_entities (nullable until resolved)
+    entity_name TEXT NOT NULL,
+    entity_type TEXT,                       -- person/place/event/concept
+    wikidata_qid TEXT,
+    key_facts TEXT NOT NULL DEFAULT '[]',   -- JSON: same schema as curriculum_nodes.key_facts
+    sources TEXT NOT NULL DEFAULT '[]',     -- JSON: [{source, capture_id, source_text, added_at}]
+    stability_days REAL NOT NULL DEFAULT 1.0,
+    due_at INTEGER NOT NULL DEFAULT 0,
+    last_reviewed_at INTEGER,
+    last_score TEXT,
+    review_count INTEGER NOT NULL DEFAULT 0,
+    cached_question TEXT,
+    question_history TEXT NOT NULL DEFAULT '[]',
+    fsrs_card_json TEXT,
+    -- Phase 2: cached Wikidata structured properties (P22, P26, P39, P580, etc.)
+    -- Populated lazily by _fetch_wikidata_props() when entity has a QID.
+    -- JSON shape: {"fetched_at": unix_ts, "props": {"P22": [{"qid":..., "label":...}, ...], ...}}
+    wikidata_props_json TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ke_entity ON knowledge_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_ke_due ON knowledge_entities(due_at);
+CREATE INDEX IF NOT EXISTS idx_ke_qid ON knowledge_entities(wikidata_qid);
+
 -- ===== Curriculum System (replaces JSON files in data/curricula/) =====
 
 -- Curriculum domains (e.g. "Sicily: History, Culture, and Legacy")
@@ -823,6 +854,43 @@ MIGRATIONS = [
     "ALTER TABLE microlearning_quizzes ADD COLUMN fact_id TEXT",
     "ALTER TABLE microlearning_quizzes ADD COLUMN rich_answer TEXT",
     "CREATE INDEX IF NOT EXISTS idx_mlq_fact ON microlearning_quizzes(fact_id)",
+    # Entity-keyed knowledge items (Phase 1 of entity-first architecture)
+    """CREATE TABLE IF NOT EXISTS knowledge_entities (
+        id TEXT PRIMARY KEY,
+        entity_id TEXT,
+        entity_name TEXT NOT NULL,
+        entity_type TEXT,
+        wikidata_qid TEXT,
+        key_facts TEXT NOT NULL DEFAULT '[]',
+        sources TEXT NOT NULL DEFAULT '[]',
+        stability_days REAL NOT NULL DEFAULT 1.0,
+        due_at INTEGER NOT NULL DEFAULT 0,
+        last_reviewed_at INTEGER,
+        last_score TEXT,
+        review_count INTEGER NOT NULL DEFAULT 0,
+        cached_question TEXT,
+        question_history TEXT NOT NULL DEFAULT '[]',
+        fsrs_card_json TEXT,
+        created_at INTEGER NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_ke_entity ON knowledge_entities(entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ke_due ON knowledge_entities(due_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ke_qid ON knowledge_entities(wikidata_qid)",
+    # Phase 2: cached Wikidata structured properties for enrichment
+    "ALTER TABLE knowledge_entities ADD COLUMN wikidata_props_json TEXT",
+    # Voice-driven structural card suggestions
+    """CREATE TABLE IF NOT EXISTS suggested_cards (
+        id TEXT PRIMARY KEY,
+        card_type TEXT NOT NULL,
+        source_transcript_ids TEXT NOT NULL DEFAULT '[]',
+        entities TEXT NOT NULL DEFAULT '[]',
+        domain_ids TEXT NOT NULL DEFAULT '[]',
+        rationale TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sc_status ON suggested_cards(status)",
+    "CREATE INDEX IF NOT EXISTS idx_sc_type ON suggested_cards(card_type)",
 ]
 
 

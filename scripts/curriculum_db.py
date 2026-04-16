@@ -713,6 +713,74 @@ def _build_entity_intro_items(items: list[dict], entity_knowledge: dict[str, str
     return result
 
 
+def _build_entity_capture_intros(items: list[dict], conn) -> list[dict]:
+    """Insert entity-briefing cards before the first review of a fresh
+    entity_capture item.
+
+    Fires when ALL of:
+    - item.type == 'review' (entity_capture items render as review type)
+    - provenance.origin == 'entity_capture'
+    - review_count == 0 (never reviewed yet)
+    - linked shared_entities row has a meaningful description
+
+    One intro per entity per session, inserted before that entity's first
+    review appearance. May prove redundant with the rich_answer once
+    observed; if so, gate on capture-age or drop entirely.
+    """
+    # Find candidate entity_ids (fresh entity_capture items)
+    candidates: dict[str, int] = {}  # entity_id → first item index in `items`
+    for i, item in enumerate(items):
+        if item.get('type') != 'review':
+            continue
+        prov = item.get('provenance') or {}
+        if prov.get('origin') != 'entity_capture':
+            continue
+        if (item.get('review_count') or 0) != 0:
+            continue
+        eid = prov.get('entity_id') or item.get('entity_id')
+        if not eid or eid in candidates:
+            continue
+        candidates[eid] = i
+
+    if not candidates:
+        return items
+
+    details = _load_entity_details_for_intros(list(candidates.keys()), conn)
+
+    # Build intros only for entities with a non-trivial description
+    intros_by_idx: dict[int, list[dict]] = {}
+    for eid, idx in candidates.items():
+        d = details.get(eid)
+        if not d:
+            continue
+        desc = (d.get('description') or '').strip()
+        if len(desc) < 20:
+            continue  # No useful briefing possible
+        intros_by_idx.setdefault(idx, []).append({
+            'type': 'entity_intro',
+            'entity_id': eid,
+            'entity_name': d['name'],
+            'entity_type': d.get('entity_type'),
+            'modern_name': d.get('modern_name'),
+            'description': desc,
+            'latitude': d.get('latitude'),
+            'longitude': d.get('longitude'),
+            'wikipedia_url': d.get('wikipedia_url'),
+            'date_start': d.get('date_start'),
+            'date_end': d.get('date_end'),
+        })
+
+    if not intros_by_idx:
+        return items
+
+    result: list[dict] = []
+    for i, item in enumerate(items):
+        for intro in intros_by_idx.get(i, []):
+            result.append(intro)
+        result.append(item)
+    return result
+
+
 MAX_NEXUS_CARDS = 2  # max nexus cards per review batch
 
 
@@ -916,19 +984,25 @@ def _annotate_item_entities(item: dict, entity_index: list[dict]) -> dict:
 
 
 def _mix_structural_cards(items: list, conn, domain_filter: str | None,
-                          now_ms: int) -> list:
-    """Mix structural cards (aspect + sequence) into the review stream.
+                          now_ms: int, quick_quizzes: list | None = None) -> list:
+    """Mix structural cards + quick quizzes into the review stream.
 
-    Inserts structural cards at positions 3, 6, 9 (every 3rd card) among the
-    existing review/ML items. Only includes cards that have due positions.
+    Creates session rhythm (E6 hypothesis):
+      structural (30s) → quiz (6s) → review (20s) → review → quiz → structural...
+
+    Rules:
+    - After each structural card: insert 1-2 quick quizzes
+    - Between review/ML items: insert a quiz every 2nd item
+    - Never show 3+ quick quizzes in a row
     """
     due_cutoff = now_ms + 24 * 3600 * 1000
-    # Query each card type separately to guarantee mix (3 aspect + 2 sequence max)
+    # Query each card type separately to guarantee mix (3 aspect + 2 sequence + 2 synchronic max)
     domain_clause = "AND sc.domain_id LIKE ?" if domain_filter else ""
     domain_params = [f'%{domain_filter}%'] if domain_filter else []
     # Activation gating: only show structural cards for domains the user has studied.
     # Aspect cards require ≥5 knowledge_items in the domain (from books/voice/elicitation).
     # Sequence cards additionally require ≥3 reviewed aspect positions in the domain.
+    # Synchronic cards require ≥5 KI in the anchor's domain (same as aspect).
     ASPECT_GATE_THRESHOLD = 5
     SEQUENCE_GATE_THRESHOLD = 3
 
@@ -936,7 +1010,13 @@ def _mix_structural_cards(items: list, conn, domain_filter: str | None,
     STRUCTURAL_ONLY = False
 
     card_rows = []
-    for card_type, limit in [('aspect', 10 if STRUCTURAL_ONLY else 3), ('sequence', 5 if STRUCTURAL_ONLY else 2)]:
+    for card_type, limit in [
+        ('aspect', 10 if STRUCTURAL_ONLY else 3),
+        ('sequence', 5 if STRUCTURAL_ONLY else 2),
+        ('synchronic', 5 if STRUCTURAL_ONLY else 2),
+        ('cast', 5 if STRUCTURAL_ONLY else 2),
+        ('causal', 5 if STRUCTURAL_ONLY else 1),
+    ]:
         gate_clause = f"""
             AND (SELECT COUNT(*) FROM knowledge_items ki
                  WHERE ki.curriculum_domain = sc.domain_id) >= {ASPECT_GATE_THRESHOLD}"""
@@ -947,15 +1027,21 @@ def _mix_structural_cards(items: list, conn, domain_filter: str | None,
                  WHERE sc2.domain_id = sc.domain_id
                  AND sc2.card_type = 'aspect'
                  AND sp2.review_count > 0) >= {SEQUENCE_GATE_THRESHOLD}"""
+        if card_type == 'cast':
+            gate_clause += """
+            AND EXISTS (SELECT 1 FROM knowledge_items ki2
+                        WHERE ki2.curriculum_node_id = sc.node_id
+                        AND ki2.curriculum_domain = sc.domain_id
+                        AND ki2.review_count > 0)"""
         # Domain-diverse selection: pick best card per domain, then take top N.
         # Without this, all cards would come from whichever domain was generated first.
         rows = conn.execute(f'''
             SELECT id, card_type, title, description, domain_id, node_id,
-                   date_start, date_end, review_count, hooks, domain_title
+                   date_start, date_end, date_anchor, review_count, hooks, domain_title
             FROM (
                 SELECT sc.id, sc.card_type, sc.title, sc.description,
                        sc.domain_id, sc.node_id,
-                       sc.date_start, sc.date_end, sc.review_count, sc.hooks,
+                       sc.date_start, sc.date_end, sc.date_anchor, sc.review_count, sc.hooks,
                        cd.title as domain_title,
                        ROW_NUMBER() OVER (
                            PARTITION BY sc.domain_id
@@ -1027,6 +1113,17 @@ def _mix_structural_cards(items: list, conn, domain_filter: str | None,
                 if isinstance(variants, dict):
                     pos_data['year'] = variants.get('year')
                     pos_data['year_display'] = variants.get('year_display', '')
+                    if variants.get('scale_to_next'):
+                        pos_data['scale_to_next'] = variants['scale_to_next']
+            elif card_type == 'synchronic':
+                # Pass through domain/label/connection from question_variants
+                pos_data['question_variants'] = p['question_variants']
+            elif card_type == 'cast':
+                # Cast cards store role/significance/entity_id in question_variants
+                pos_data['question_variants'] = p['question_variants']
+            elif card_type == 'causal':
+                # Causal cards store event/year_display/connection_to_next
+                pos_data['question_variants'] = p['question_variants']
             pos_list.append(pos_data)
 
         item = {
@@ -1047,25 +1144,66 @@ def _mix_structural_cards(items: list, conn, domain_filter: str | None,
             item['description'] = card.get('description', '')
             item['date_start'] = card.get('date_start')
             item['date_end'] = card.get('date_end')
+        elif card_type == 'synchronic':
+            item['description'] = card.get('description', '')
+            item['date_anchor'] = card.get('date_anchor')
+        elif card_type == 'cast':
+            item['node_id'] = card['node_id']
+            item['description'] = card.get('description', '')
+        elif card_type == 'causal':
+            item['description'] = card.get('description', '')
 
         structural_items.append(item)
 
     if STRUCTURAL_ONLY:
         return structural_items
 
-    # Interleave: insert structural cards every 3rd position
+    qq_pool = list(quick_quizzes or [])
+    qq_idx = 0
+
+    # Build rhythm: structural → quiz → review → review → quiz → ...
     merged = []
     struct_idx = 0
+    consecutive_quizzes = 0  # guard against 3+ quizzes in a row
+
     for i, item in enumerate(items):
         merged.append(item)
-        if (i + 1) % 3 == 0 and struct_idx < len(structural_items):
+        consecutive_quizzes = 0
+        pos = i + 1
+
+        # Every 3rd item: insert structural card
+        if pos % 3 == 0 and struct_idx < len(structural_items):
             merged.append(structural_items[struct_idx])
             struct_idx += 1
+            consecutive_quizzes = 0
 
-    # Append remaining structural cards
+            # After structural card: insert 1-2 quick quizzes (palate cleanser)
+            for _ in range(min(2, len(qq_pool) - qq_idx)):
+                if consecutive_quizzes >= 2:
+                    break
+                merged.append(qq_pool[qq_idx])
+                qq_idx += 1
+                consecutive_quizzes += 1
+
+        # Every 2nd item (not already followed by structural): insert quiz
+        elif pos % 2 == 0 and qq_idx < len(qq_pool) and consecutive_quizzes < 2:
+            merged.append(qq_pool[qq_idx])
+            qq_idx += 1
+            consecutive_quizzes += 1
+
+    # Append remaining structural cards (interleaved with remaining quizzes)
     while struct_idx < len(structural_items):
         merged.append(structural_items[struct_idx])
         struct_idx += 1
+        # 1 quiz after each remaining structural card
+        if qq_idx < len(qq_pool):
+            merged.append(qq_pool[qq_idx])
+            qq_idx += 1
+
+    # Append remaining quizzes at tail (better than clustering, but still last)
+    while qq_idx < len(qq_pool):
+        merged.append(qq_pool[qq_idx])
+        qq_idx += 1
 
     return merged
 
@@ -1223,6 +1361,107 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
 
             candidates.append((score, item, is_gap_fill))
 
+        # ── Query knowledge_entities (entity-keyed, no curriculum) ───
+        # Entity items come from voice captures about topics outside existing
+        # curricula. They have no knowledge_state — shown directly with a
+        # fixed knowledge_weight. See research/entity-first-architecture.md.
+        try:
+            ke_rows = conn.execute(
+                '''SELECT id, entity_id, entity_name, entity_type, wikidata_qid,
+                          stability_days, due_at, last_reviewed_at, last_score,
+                          review_count, cached_question, created_at, sources
+                   FROM knowledge_entities
+                   WHERE cached_question IS NOT NULL'''
+            ).fetchall()
+        except Exception as e:
+            print(f'[review-stream] knowledge_entities query failed: {e}', flush=True)
+            ke_rows = []
+
+        for r in ke_rows:
+            item = dict(r)
+            review_count = item['review_count'] or 0
+            due_at = item['due_at'] or 0
+            knowledge_weight = 6.0  # Between engaged (8.0) and mentioned (4.0)
+            schedule_reason = 'not_due'
+            overdue_days = 0.0
+
+            # Recency boost: fresh voice captures surface quickly in next review
+            age_hours = (now_ms - (item.get('created_at') or now_ms)) / 3600000
+            recency_boost = max(0, 3.0 - age_hours / 16)  # +3.0 at capture, decays to 0 over 48h
+            score_adj = recency_boost
+
+            if review_count == 0:
+                score = knowledge_weight + 2.0 + random.random() + recency_boost
+                schedule_reason = 'never_reviewed'
+            elif due_at <= now_ms:
+                overdue_days = (now_ms - due_at) / (24 * 3600 * 1000)
+                score = knowledge_weight + min(overdue_days * 0.3, 5.0) + 10.0
+                if item['last_score'] == 'missed':
+                    score += 3.0
+                schedule_reason = 'overdue'
+            elif due_at <= soon:
+                score = knowledge_weight + 1.0
+                schedule_reason = 'due_soon'
+            else:
+                days_until = (due_at - now_ms) / (24 * 3600 * 1000)
+                score = max(0.1, knowledge_weight - days_until * 0.5)
+
+            try:
+                cq_data = json.loads(item.get('cached_question') or '{}')
+            except (json.JSONDecodeError, TypeError):
+                cq_data = {}
+            fact_type = cq_data.get('answer_type', '')
+            fact_type_adj = 0.0
+            if fact_type in ('date', 'event', 'person'):
+                score += 2.0
+                fact_type_adj = 2.0
+            elif fact_type in ('significance', 'connection'):
+                score -= 1.0
+                fact_type_adj = -1.0
+
+            # Parse sources (voice captures) for About-this-card provenance.
+            # Each entry: {source, capture_id, source_text, added_at}
+            try:
+                ke_sources = json.loads(item.get('sources') or '[]')
+                if not isinstance(ke_sources, list):
+                    ke_sources = []
+            except (json.JSONDecodeError, TypeError):
+                ke_sources = []
+
+            # Pseudo-fields so the existing card builder treats this like
+            # a review item but with entity framing
+            ent_type = (item.get('entity_type') or 'entity').title()
+            item['curriculum_domain'] = 'entity'
+            item['curriculum_node_id'] = item.get('entity_id') or item['id']
+            item['node_title'] = item.get('entity_name') or ''
+            item['node_description'] = ''
+            item['domain_title'] = ent_type
+            item['node_knowledge'] = 'engaged'
+            item['node_confidence'] = 0.5
+            item['node_level'] = 2
+            item['node_date_start'] = None
+            item['triggered_follow_ups'] = '[]'
+            item['sources'] = json.dumps(ke_sources)
+
+            item['_provenance'] = {
+                'origin': 'entity_capture',
+                'is_gap_fill': False,
+                'stream_score': round(score, 2),
+                'schedule_reason': schedule_reason,
+                'overdue_days': round(overdue_days, 1),
+                'knowledge_weight': knowledge_weight,
+                'fact_type_adj': fact_type_adj,
+                'recency_boost': round(recency_boost, 2),
+                'sources': ke_sources,
+                'created_at': item.get('created_at'),
+                'due_at': due_at,
+                'last_reviewed_at': item.get('last_reviewed_at'),
+                'entity_id': item.get('entity_id'),
+                'wikidata_qid': item.get('wikidata_qid'),
+            }
+
+            candidates.append((score, item, False))
+
         # ── Interleave domains for variety ───────────────────────────
         # Group by domain, sort each group by score, then round-robin
         # Cap gap-fill items at 3 per batch to avoid flooding with unexplored topics
@@ -1275,14 +1514,26 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
             node_id = item.get('curriculum_node_id')
             domain_id = item.get('curriculum_domain')
             if node_id and domain_id and (domain_id, node_id) not in node_key_facts:
-                try:
-                    kf_row = conn.execute(
-                        'SELECT key_facts FROM curriculum_nodes WHERE id=? AND domain_id=?',
-                        (node_id, domain_id)).fetchone()
-                    if kf_row and kf_row['key_facts']:
-                        node_key_facts[(domain_id, node_id)] = json.loads(kf_row['key_facts'])
-                except Exception:
-                    pass
+                if domain_id == 'entity':
+                    # Entity-keyed items store their own key_facts on the
+                    # knowledge_entities row — use those as related_facts.
+                    try:
+                        kf_row = conn.execute(
+                            'SELECT key_facts FROM knowledge_entities WHERE id=?',
+                            (item['id'],)).fetchone()
+                        if kf_row and kf_row['key_facts']:
+                            node_key_facts[(domain_id, node_id)] = json.loads(kf_row['key_facts'])
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        kf_row = conn.execute(
+                            'SELECT key_facts FROM curriculum_nodes WHERE id=? AND domain_id=?',
+                            (node_id, domain_id)).fetchone()
+                        if kf_row and kf_row['key_facts']:
+                            node_key_facts[(domain_id, node_id)] = json.loads(kf_row['key_facts'])
+                    except Exception:
+                        pass
 
         items = []
         for _score, item in selected:
@@ -1423,10 +1674,15 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
                 'quiz_suggestions': quiz_suggestions,
                 'existing_quizzes': existing_quizzes,
                 'provenance': item.get('_provenance', {}),
+                # Entity-keyed items carry their entity identity for optional
+                # client rendering (entity-first architecture, Phase 1).
+                'entity_id': item.get('entity_id', ''),
+                'wikidata_qid': item.get('wikidata_qid', ''),
             }
             items.append(card)
 
         # ── Mix in microlearning ─────────────────────────────────────────
+        quick_quiz_pool = []  # filled below; used by _mix_structural_cards
         # Two streams:
         # 1. NEW ML cards (never seen) → full card with all quizzes, front of queue
         # 2. DUE individual quizzes (from previously-seen cards) → interleaved
@@ -1616,12 +1872,12 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
 
             # Merge: SR items first, then interleave ML cards
             # High-priority ML (voice/user): every 3rd SR card
-            # Low-priority ML (follow-up) + due quizzes: every 7th SR card
+            # Low-priority ML (follow-up only): every 7th SR card
+            # Due quizzes (seen_ml) are handled later by _mix_structural_cards
+            # for proper structural→quiz→review rhythm
             merged = []
             hi_idx = 0
             lo_idx = 0
-            sq_idx = 0  # seen_ml (due quizzes)
-            low_pool = low_ml + seen_ml  # combine follow-up new cards with due quizzes
 
             for i, item in enumerate(items):
                 merged.append(item)
@@ -1630,27 +1886,30 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
                 if pos % 3 == 0 and hi_idx < len(high_ml):
                     merged.append(high_ml[hi_idx])
                     hi_idx += 1
-                # Low-priority ML + due quizzes at 1:7
-                if pos % 7 == 0 and lo_idx < len(low_pool):
-                    merged.append(low_pool[lo_idx])
+                # Low-priority ML at 1:7
+                if pos % 7 == 0 and lo_idx < len(low_ml):
+                    merged.append(low_ml[lo_idx])
                     lo_idx += 1
 
             # Append any remaining ML cards at the tail (not front-loaded)
             while hi_idx < len(high_ml):
                 merged.append(high_ml[hi_idx])
                 hi_idx += 1
-            while lo_idx < len(low_pool):
-                merged.append(low_pool[lo_idx])
+            while lo_idx < len(low_ml):
+                merged.append(low_ml[lo_idx])
                 lo_idx += 1
 
             items = merged
+            # Quick quiz pool: due individual quizzes for structural interleaving
+            quick_quiz_pool = seen_ml
         except Exception as e:
             print(f'[review-stream] microlearning query failed: {e}', flush=True)
             import traceback; traceback.print_exc()
 
-        # ── Mix in structural (aspect) cards ─────────────────────────────
+        # ── Mix in structural (aspect) cards + quick quizzes ────────────
         try:
-            items = _mix_structural_cards(items, conn, domain_filter, now_ms)
+            items = _mix_structural_cards(items, conn, domain_filter, now_ms,
+                                          quick_quizzes=quick_quiz_pool)
         except Exception as e:
             print(f'[review-stream] structural card mixing failed: {e}', flush=True)
             import traceback; traceback.print_exc()
@@ -1663,6 +1922,12 @@ def generate_review_stream(domain_filter: str | None = None, limit: int = 20,
         # Insert entity intro cards for unknown entities
         entity_knowledge = _load_entity_knowledge(conn)
         items = _build_entity_intro_items(items, entity_knowledge, conn)
+
+        # Insert entity intro cards for freshly-captured entity_capture items
+        # (review_count=0). Briefs the user on the entity's identity before the
+        # first quiz question. Skipped when the shared_entities row has no
+        # useful description — rich_answer still covers the gap post-grade.
+        items = _build_entity_capture_intros(items, conn)
 
         # Nexus cards disabled — detection works (entities spanning 3+ curricula)
         # but cards lack synthesized content. Needs LLM-generated connection
@@ -2403,6 +2668,181 @@ def get_dashboard_stats(conn=None) -> dict:
             'knowledge_profile': kp,
             'timeline': timeline[:30],
             'generated_at': datetime.utcnow().isoformat() + 'Z',
+        }
+    finally:
+        if own:
+            conn.close()
+
+
+def get_native_stats(conn=None) -> dict:
+    """Build statistics optimised for the native Stats tab.
+
+    Returns structural card progress per domain, knowledge level distribution,
+    activity heatmap (last 8 weeks), review counts by card type, and today's summary.
+    """
+    own = conn is None
+    if own:
+        conn = get_connection(readonly=True)
+    try:
+        now_ms = int(time.time() * 1000)
+        today_start_ms = now_ms - (now_ms % (24 * 60 * 60 * 1000))
+        end_today_ms = today_start_ms + 24 * 60 * 60 * 1000
+
+        # ── Today's summary ────────────────────────────────────────
+        reviewed_today = conn.execute(
+            'SELECT COUNT(*) FROM knowledge_items WHERE last_reviewed_at >= ?',
+            (today_start_ms,)
+        ).fetchone()[0]
+        reviewed_today += conn.execute(
+            'SELECT COUNT(*) FROM microlearning_cards WHERE last_reviewed_at >= ?',
+            (today_start_ms,)
+        ).fetchone()[0]
+        # Structural positions reviewed today
+        reviewed_today += conn.execute(
+            'SELECT COUNT(*) FROM structural_positions WHERE last_reviewed_at >= ?',
+            (today_start_ms,)
+        ).fetchone()[0]
+
+        due_today = conn.execute(
+            'SELECT COUNT(*) FROM knowledge_items WHERE due_at <= ?',
+            (end_today_ms,)
+        ).fetchone()[0]
+
+        # ── Structural card progress per domain ────────────────────
+        structural_progress = []
+        rows = conn.execute("""
+            SELECT sc.domain_id, cd.title as domain_title,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN sp.review_count > 0 THEN 1 ELSE 0 END) as reviewed
+            FROM structural_positions sp
+            JOIN structural_cards sc ON sc.id = sp.card_id
+            LEFT JOIN curriculum_domains cd ON sc.domain_id = cd.id
+            GROUP BY sc.domain_id
+            ORDER BY reviewed DESC, total DESC
+        """).fetchall()
+        for r in rows:
+            structural_progress.append({
+                'domain_id': r['domain_id'],
+                'domain_title': r['domain_title'] or r['domain_id'],
+                'total': r['total'],
+                'reviewed': r['reviewed'],
+            })
+
+        # Per card-type breakdown (for the card type chart)
+        card_type_counts = {}
+        for r in conn.execute("""
+            SELECT sc.card_type, COUNT(*) as total,
+                   SUM(CASE WHEN sp.review_count > 0 THEN 1 ELSE 0 END) as reviewed
+            FROM structural_positions sp
+            JOIN structural_cards sc ON sc.id = sp.card_id
+            GROUP BY sc.card_type
+        """).fetchall():
+            card_type_counts[r['card_type']] = {
+                'total': r['total'], 'reviewed': r['reviewed'],
+            }
+
+        # ── Knowledge level distribution per domain ────────────────
+        knowledge_levels = []
+        for meta in list_curricula(conn=conn):
+            domain_id = meta['id']
+            dist = {'unknown': 0, 'mentioned': 0, 'engaged': 0, 'anchored': 0}
+            nodes = conn.execute(
+                'SELECT cn.id, COALESCE(ks.knowledge, ?) as knowledge '
+                'FROM curriculum_nodes cn '
+                'LEFT JOIN knowledge_states ks ON cn.id = ks.node_id AND cn.domain_id = ks.domain_id '
+                'WHERE cn.domain_id = ?',
+                ('unknown', domain_id)
+            ).fetchall()
+            for n in nodes:
+                k = n['knowledge'] if n['knowledge'] in dist else 'unknown'
+                dist[k] += 1
+            node_count = len(nodes)
+            if node_count == 0:
+                continue
+            # Only include domains with any non-unknown knowledge
+            if dist['mentioned'] + dist['engaged'] + dist['anchored'] == 0:
+                continue
+            knowledge_levels.append({
+                'domain_id': domain_id,
+                'title': meta.get('title', domain_id),
+                'node_count': node_count,
+                'distribution': dist,
+            })
+        # Sort by total known (non-unknown) descending
+        knowledge_levels.sort(
+            key=lambda d: d['distribution']['anchored'] + d['distribution']['engaged'] + d['distribution']['mentioned'],
+            reverse=True,
+        )
+
+        # ── Activity heatmap (last 56 days / 8 weeks) ─────────────
+        heatmap = {}
+        for r in conn.execute("""
+            SELECT date(created_at) as day, COUNT(*) as cnt
+            FROM interaction_log
+            WHERE created_at >= date('now', '-56 days')
+            GROUP BY date(created_at)
+            ORDER BY day
+        """).fetchall():
+            heatmap[r['day']] = r['cnt']
+
+        # ── Review counts by card type (last 30 days) ─────────────
+        review_by_type = {}
+        for r in conn.execute("""
+            SELECT COALESCE(card_type, 'unknown') as ct, COUNT(*) as cnt
+            FROM interaction_log
+            WHERE event IN ('review_result', 'review_answer', 'structural_grade', 'review_quiz_result')
+              AND created_at >= date('now', '-30 days')
+            GROUP BY card_type
+        """).fetchall():
+            review_by_type[r['ct']] = r['cnt']
+
+        # Also count structural grading events with their card sub-types
+        for r in conn.execute("""
+            SELECT json_extract(extra, '$.card_type') as ct, COUNT(*) as cnt
+            FROM interaction_log
+            WHERE event = 'structural_grade'
+              AND created_at >= date('now', '-30 days')
+              AND extra IS NOT NULL
+            GROUP BY ct
+        """).fetchall():
+            if r['ct']:
+                review_by_type[f"structural_{r['ct']}"] = r['cnt']
+
+        # ── Score distribution (all time) ──────────────────────────
+        scores = {'knew': 0, 'partly': 0, 'missed': 0}
+        for tbl in ('knowledge_items', 'microlearning_cards'):
+            for r in conn.execute(
+                f'SELECT last_score, COUNT(*) as cnt FROM {tbl} '
+                'WHERE last_score IS NOT NULL GROUP BY last_score'
+            ).fetchall():
+                if r['last_score'] in scores:
+                    scores[r['last_score']] += r['cnt']
+
+        # ── Total item counts ──────────────────────────────────────
+        ki_total = conn.execute('SELECT COUNT(*) FROM knowledge_items').fetchone()[0]
+        ml_total = conn.execute(
+            "SELECT COUNT(*) FROM microlearning_cards WHERE status = 'completed'"
+        ).fetchone()[0]
+        quiz_total = conn.execute('SELECT COUNT(*) FROM microlearning_quizzes').fetchone()[0]
+        struct_total = conn.execute('SELECT COUNT(*) FROM structural_positions').fetchone()[0]
+
+        return {
+            'today': {
+                'reviewed': reviewed_today,
+                'due': due_today,
+            },
+            'structural_progress': structural_progress,
+            'card_type_counts': card_type_counts,
+            'knowledge_levels': knowledge_levels,
+            'heatmap': heatmap,
+            'review_by_type': review_by_type,
+            'scores': scores,
+            'totals': {
+                'knowledge_items': ki_total,
+                'microlearning_cards': ml_total,
+                'quizzes': quiz_total,
+                'structural_positions': struct_total,
+            },
         }
     finally:
         if own:

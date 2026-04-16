@@ -7,7 +7,15 @@ from __future__ import annotations
 
 import base64
 import os
+from pathlib import Path
 from typing import Any
+
+# Load .env so standalone scripts (outside systemd) can access GEMINI_KEY
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / '.env')
+except ImportError:
+    pass
 
 from google import genai
 

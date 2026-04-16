@@ -1,6 +1,340 @@
 # Knowledge System Implementation Status
 
-**Date**: April 14, 2026 (last updated — session 75: activation gating + voice pipeline)
+**Date**: April 16, 2026 (last updated — session 83: trust line + E3 measurement + suggestion pipeline)
+
+## Session 83: Review Quality Polish + Experiment Instrumentation (April 16, 2026)
+
+### Trust Line on Aspect Cards
+- Added "3/4 known · 'What year?' due Thursday" line below card title
+- Computed client-side from existing FSRS position data (`review_count` + `last_score`)
+- Green accent when all positions mastered, hidden on first encounter (0 reviews)
+- Added `review_count` and `last_score` to AspectPosition TypeScript interface (server already sent these)
+- Title marginBottom reduced 12→4px to accommodate the trust line
+
+### E3 Collateral Exposure Measurement
+- `scripts/measure_collateral_exposure.py` — analysis script for the collateral exposure hypothesis
+- Reports: total positions, actively graded, collateral-only (stability>1.0 but review_count=0), untouched
+- Per-card breakdown showing graded vs collateral vs untouched positions
+- Current state: 6 graded positions, 0 collateral-only (all positions on graded cards were actively tested)
+- Script flags insufficient data (N<20) and estimates sessions needed for meaningful comparison
+
+### Card Suggestion Generation Pipeline
+- `scripts/generate_from_suggestions.py` — turns approved `suggested_cards` into real structural cards via Gemini Flash
+- Supports both sequence and synchronic card types
+- Entity-level overlap detection against existing structural cards
+- `POST /admin/suggested-cards/approve` and `POST /admin/suggested-cards/reject` endpoints
+- Generated first card from suggestions: "The Rise of the Norman Kingdom of Sicily" (6 milestones, 1031-1250)
+  - Roger I arrival → Fall of Bari → Roger II birth → Coronation → Frederick II birth → Frederick II death
+- Installed `python3-dotenv` on server (was missing from apt)
+
+### Type-Specific Aspect Mnemonics (Priority 2)
+- `scripts/generate_aspect_mnemonics.py` — batch Gemini Flash job for type-specific mnemonics
+- 5 mnemonic strategies keyed by hook_type:
+  - TEMPORAL → temporal_anchor: "Same year as X, 50 years after Y"
+  - RELATIONAL → role_chain: "X's general who later became Y"
+  - STRUCTURAL → cause_effect: "Because X happened, Y led to Z"
+  - PARALLEL → contrast: "Unlike X who did A, Y did B"
+  - IDENTITY → vivid_detail: "The one who..., the only Roman to..."
+- Batch run: 520 aspect cards, ~92% success rate (Gemini Flash timeouts on ~8%)
+- Quality verified: mnemonics correctly use type-specific strategies, reference known historical events
+
+### Scale Annotations on Sequence Cards (Priority 3)
+- Client-side gap computation: "— 46 years —" shown between timeline milestones (for gaps >= 5 years)
+- `scripts/generate_scale_annotations.py` — batch Gemini Flash job for rich historical comparisons
+  - Uses user's studied domains for personalized anchors
+  - Stores in `question_variants.scale_to_next` per position
+- 18 sequence cards processed, 76 annotations generated, 0 errors
+- Example: "— 46 years — roughly the same span as Augustus' principate"
+- `curriculum_db.py` passes `scale_to_next` through stream when present
+- `SequenceCard.tsx` prefers LLM annotation over raw gap, falls back gracefully
+
+## Session 82: Transcript Reprocessing + Card Suggestions (April 16, 2026)
+
+### Gemini Key Fix for Standalone Scripts
+- Added `python-dotenv` loading at import time in `gemini_llm.py`
+- All scripts that import gemini_llm now auto-load `.env` — no more missing `GEMINI_KEY` when running via SSH
+
+### Voice Transcript Entity Reprocessing
+- `scripts/reprocess_all_transcripts.py` — idempotent script to backfill Wikidata entity resolution on historical voice transcripts
+- 10 voice_capture + voice_capture_entity transcripts: 4 already resolved (from sessions 77-78), 6 needed reprocessing
+- Results: 61 new entity_resolutions (1368→1429), 29 new shared_entities, 87/94 voice resolutions have QIDs
+- Lesson learned: must stop research server before running batch DB writes (SQLite write lock contention)
+
+### Voice-Driven Card Suggestion Detection
+- `scripts/detect_card_suggestions.py` — scans voice transcript entities, resolves to shared_entities (for dates/domains), detects patterns:
+  - **Temporal sequences**: same-domain entities with date gaps <200y, ≥50y span, ≥3 entities
+  - **Contemporaries**: cross-domain entities with ≥10y lifetime overlap
+- `suggested_cards` table (migration in db.py): stores pending suggestions for admin review
+- `GET /admin/suggested-cards` endpoint for reviewing suggestions
+- Initial results: 2 sequence suggestions detected:
+  1. Sicily succession: Roger I → Roger II → Frederick II (1031–1194)
+  2. Norman succession: Rollo → Richard I of Normandy → Gunnora → Æthelred the Unready (860–966)
+
+### Review Stream Validation
+- All 5 structural card types flowing: aspect(3), sequence(1), synchronic(2), cast(2), causal(1)
+- Full stream: 26 review + 10 ML + 6 entity_intro + 4 quiz + 9 structural = 55 items
+- Quick quizzes confirmed present (3,863 in DB across all types)
+
+### Commits
+- `48eca21` — Fix: load .env in gemini_llm.py for standalone script access
+- `ba6e71e` — Add transcript reprocessing script for Wikidata entity backfill
+- `6e242bf` — Voice-driven card suggestion detection + admin endpoint
+
+## Session 81: Stats Enhancement + Collateral Exposure + Leech Detection (April 16, 2026)
+
+### Stats Tab Rebuilt (`stats.tsx`)
+- New `/stats/native` endpoint in `curriculum_db.py` (`get_native_stats()`) — single JSON response with all stats data
+- **Structural progress bars**: per-domain reviewed/total positions (e.g., "Greece 4/315")
+- **Knowledge level stacked bars**: anchored/engaged/mentioned/unknown per domain, legend, node counts
+- **Activity heatmap**: 8-week calendar grid, rubric-colored cells by intensity
+- **Score distribution**: all-time knew/partly/missed stacked bar with percentages
+- **Card type pills**: aspect/cast/causal/sequence/synchronic reviewed/total counts
+- No external chart libraries — pure React Native View percentage-width bars
+
+### FSRS Optimizer (`scripts/optimize_fsrs.py`)
+- Extracts review history from interaction_log → py-fsrs ReviewLog objects
+- Deduplicates events within 60s window per item
+- 195 events across 106 cards, 56 with 2+ reviews
+- Result: 0% improvement — FSRS-6 defaults adequate at this data volume
+- Re-run at 500+ events. Requires `fsrs[optimizer]` extra (torch + pandas)
+
+### Collateral Exposure Tracking (Priority 4 / Experiment E3)
+- `record_structural_answer()` now credits anchor positions (visible but not tested) with 30% of normal FSRS stability gain
+- Implementation: after grading blanked positions, finds all non-graded positions for card, applies Good rating × 0.3 stability factor
+- Logged as `collateral_exposure` events in interaction_log
+- Measurement plan: after 2 weeks, compare retention of collateral-exposed vs unexposed positions
+
+### Leech Detection (Priority 5)
+- After each "missed" answer on items with 5+ reviews, checks interaction_log for 7 consecutive misses
+- Auto-suspends item for 30 days, clears `cached_question` for regeneration on return
+- Logged as `leech_suspended` events
+- Currently no active leeches (all multi-miss items eventually learned)
+
+### Commits
+- `b8ef573` — Enhanced native Stats tab — structural progress, knowledge levels, heatmap
+- `a0f3662` — Collateral exposure tracking + leech detection + FSRS optimizer script
+- `6d6af79` — Experiment log: FSRS optimizer baseline + collateral exposure E3 setup
+
+## Session 80: Quick Quizzes, Cast Cards, Causal Chains, Stream Rhythm (April 16, 2026)
+
+### Quick Quizzes (Phase 3 — `generate_quick_quizzes.py`)
+- 4 quiz types from key_facts: `date_reverse` (414), `order` (15), `role` (323), `causal`/`location` (1,716) — 2,468 new quizzes total, 229 deduped at 0.82 cosine
+- `date_reverse` + `order` generated deterministically (principle #7); `role` + `causal` via Gemini Flash in batches of 15
+- `quiz_type` column added to `microlearning_quizzes`; total active quizzes: 3,858 (was 1,392)
+- Stream interleaving rewritten: structural→quiz→review→review→quiz rhythm ("palate cleanser" pattern). Due quizzes separated from ML low_pool, handled by `_mix_structural_cards()`. Guard against 3+ consecutive quizzes.
+- Response time tracking: `MicrolearningQuizCard` tracks `response_time_ms` from display to grade, passed through `recordReviewResult()` to server `log_interaction()`. Subtle timer indicator fades in after 3s.
+
+### Cast Cards (Phase 6a — `generate_cast_cards.py`, `CastCard.tsx`)
+- "Cast of characters" cards from nodes with ≥3 person-type entities via `entity_curriculum_links`
+- Tests: can you name each person's SPECIFIC role in THIS context? Event-specific roles, not general biography.
+- Purple badge (#6B4C8A). Anchor persons shown dimmed with role, 2-3 blanks by FSRS urgency.
+- `question_variants` stores role/significance/entity_id per position
+- Activation gate: ≥5 KI in domain + ≥1 reviewed KI for the node
+- 25 cards, 81 positions across 8 domains (3 failed due to Gemini parse errors)
+
+### Causal Chains (Phase 6b — `generate_causal_cards.py`, `CausalChainCard.tsx`)
+- "Why did X lead to Y?" reasoning chains, 3-5 per historical domain (5 domains: Greece, Rome, Sicily, Byzantine, Islamic)
+- Brown badge (#8B5E3C). Vertical chain with ↓ arrows. Connection text between links shown only when BOTH adjacent links visible.
+- 2 blanks per card (most-due links, first link always anchor)
+- `question_variants` stores event/year_display/connection_to_next per link
+- 14 chains, 63 links (e.g., "From Land Power to Naval Hegemony", "The Destruction of the Republic", "The Arab-Norman Synthesis")
+
+### Quick Wins
+- FSRS `maximum_interval`: 365 → 3650 (well-known items can reach multi-year intervals)
+- Voice recency boost: +3.0 at capture, decays to 0 over 48h (entity item scoring in `curriculum_db.py`)
+- `ResurfacingItem` type extended with `'cast' | 'causal'`
+
+### Commits
+- `e4f6346` — Session 80: Quick quizzes, cast cards, causal chains, stream rhythm
+- `63bdbbb` — Fix causal card domain filtering — match by keyword not exact ID
+
+## Session 79: Synchronic Cards + Entity Consolidation (April 16, 2026)
+
+### Priority 0: Entity Consolidation
+
+**Entity-type backfill:** All 11 `knowledge_entities` rows updated from legacy `entity_type='entity'` to correct types (6 persons, 5 events). QID-bearing entities verified against Wikidata P31; others inferred from name.
+
+**Phase 2 question regeneration:** Cleared and regenerated `cached_question` on all 11 entity items using Phase 2 enrichment pipeline (Wikidata props + temporal neighbors + voice co-occurrence). Quality improvement validated:
+- Poltava: generic "1709 famine" → graph-grounded "nine years after Narva in 1700"
+- Sigfred: generic "Treaty of Wedmore" → "Rollo (whom you've studied, 860-932)"
+- Karl XII: generic "Glorious Revolution" → "1693 earthquake devastated Sicily" (cross-domain temporal neighbor)
+
+All 6 QID entities now have cached `wikidata_props_json` (Karl XII: 10 property types).
+
+### Priority 1: Synchronic Cards (Phase 5 of structural-review-redesign)
+
+**Generation** (`generate_synchronic_cards.py`): Finds well-reviewed temporal anchors from knowledge_items, queries `shared_entities` for contemporaries from other studied domains active at anchor year, generates via Gemini Flash with connection texts explaining why each contemporary matters. Key features: 10-year proximity dedup, ≥3 cross-domain threshold, Gemini Flash prompt drops purely coincidental contemporaries.
+
+**10 synchronic cards generated** spanning 734 BC – 1194 AD across 7 domains, 48 total positions. Examples:
+- "The World in 321 AD" (Constantine anchor) — Neoplatonism, Koine Greek, Academy, Sicily/Rome
+- "The World in 1194 AD" (Frederick II anchor) — Averroes, Al-Andalus, Scholasticism, Constantinople
+- "The World in 264 BC" (Punic Wars anchor) — Carthage, Syracuse, Hiero II, Stoicism
+
+**SynchronicCard.tsx**: Geographic layout (domain rows vs timeline), 3 blanks per card (never blanks the anchor), binary grading, connection text revealed after all blanks resolved. Badge color: `colors.info` (blue, distinct from aspect gray and sequence gray).
+
+**Stream integration**: `_mix_structural_cards()` extended to query `card_type='synchronic'` (up to 2 per batch). Same activation gate as aspect cards (≥5 KI in anchor domain). Stream verified: 2 synchronic cards appear in typical 40-item batch alongside 3 aspect, 1 sequence, 20 review, etc.
+
+### Priority 2: Stream Quality Audit
+
+Comprehensive audit of review stream composition. Findings:
+- Stream is healthy: 50% review items, 26% structural (3 aspect + 1 sequence + 2 synchronic), 13% ML, 12% entity intros.
+- 564 ML cards all due/never-reviewed — infinite backlog but rate-limited by interleaving ratios (1:3 wondering, 1:7 follow_up). Not flooding the stream.
+- Structural cards flowing correctly. Sequence cards blocked in 4/5 domains (need ≥3 reviewed aspect positions; only Greece passes).
+- Design doc: `research/unified-scoring-design.md` — entity weight tuning analysis. Recommendation: add voice-capture recency boost (+3.0 decaying over 48h), keep other weights static until entity count grows.
+
+### Priority 3b: Entity Date Backfill
+
+28 persons/events backfilled from Wikidata P569/P570/P585. Date coverage: 456/590 (77%) → **484/590 (82%)**. Notable additions to synchronic card pool: Herodotus (-484 to -425), Mehmed II (1432-1481), Scipio Africanus (-235 to -183), Hippocrates (-460 to -370), Battle of Himera (-480). 87 places remain correctly dateless.
+
+### Priority 3c: E5 Baseline
+
+Pre-synchronic-card cross-domain baseline: 85% of voice transcripts contain cross-domain entity mentions (58.5% cross-domain ratio). However, many are shared geographic entities (Rome, Italy, Sicily) that naturally span curricula. True E5 test: novel cross-domain pairs after synchronic card exposure. Baseline saved in `research/unified-scoring-design.md`.
+
+### Priority 3a: Ambiguous Resolution Triage
+
+653 ambiguous entity_resolution rows → only 50 unique entities without QIDs (rest are duplicate attempts from different transcripts). Categorized:
+- **Easy wins**: 9 unique entities where top candidate was correct but margin too tight
+- **Wrong top match**: Patton→Patton Oswalt, Marathon→the sport, Salamis→the island. Fixed with manual QIDs.
+- **Concepts/periods**: 32 entities like "Ancient Skepticism", "Phenomenology" that don't map cleanly to Wikidata entities. Left as ambiguous (appropriate).
+
+**14 entities manually resolved** with verified QIDs: Abu Bakr (Q7271), Umar (Q7412), Al-Mansur (Q188832), Council of Nicaea (Q232572), Germany (Q183), Battle of Salamis (Q133201), Battle of Marathon (Q131222), George S. Patton (Q186492), Reconquista (Q16956), Marcellus (Q170363), Sunni Islam (Q483654), Early Christian Church (Q25393), Ummah (Q177053), Antigonid Macedon (Q170377).
+
+QID coverage: 89.5% → **91.9%** (542/590). Date coverage: 82.0% → **82.4%** (486/590).
+
+### Commits
+- `fb3b651` — Synchronic cards + entity consolidation (all changes)
+- `8793a6e` — Stream quality audit + unified scoring design + E5 baseline
+
+## Session 78: Phase 2 Entity-Graph Enrichment + Resolver Bug Fixes (April 15, 2026)
+
+### Wikidata Resolver Hardening (limbic, commit `e7d8498`)
+
+**Bug 3 — Karl XII spelling variants (FIXED):** `wbsearchentities` for "Karl XII of Sweden" returned only paintings because Q52934's English label is "Carl XII of Sweden". Added `REGNAL_NAME_VARIANTS` table (20 classes: Karl↔Carl↔Charles, Friedrich↔Frederick, Wilhelm↔William, Håkon↔Haakon, etc.) with regnal-shape gate (only fires on mentions with Roman numerals or "of <place>"). Resolver retries when 0 candidates returned OR `type_hint='person'` but no candidate is Q5 (human). 9 new tests.
+
+**Bug 4 — Count Odo weak-match downgrade (FIXED):** Single-candidate museum (Q67389525, type=0.30, date=0.00) was silently accepted because `total >= 0.55`. Added `_is_weak_structural_match()`: when `type_score < 0.5 AND date_score < 0.5` AND `type_hint` was supplied, `_decide()` returns `ambiguous` instead of `resolved`. 3 new tests. Documented both failure modes in `research/wikidata-resolution-quality.md` (new doc).
+
+### Phase 2: Entity-Graph Enrichment (commit `08c4551`)
+
+`generate_entity_question()` now builds a three-signal context block for the `_ENRICH_PROMPT`:
+
+1. **Wikidata structured properties** — per-type property sets (P22 father, P39 position, P1366 successor for persons; P710 participants, P276 location for battles; etc.). Cached in new column `knowledge_entities.wikidata_props_json` (90-day TTL). Legacy `entity_type='entity'` rows use union-of-all-props fallback.
+2. **Scoped temporal neighbors** — entities within ±50y that the user has ALSO captured, joined via `knowledge_entities` OR `entity_curriculum_links → knowledge_items`. Never global `shared_entities` — preserves "user's own graph" constraint.
+3. **Voice co-occurrence** — top-N entities most frequently mentioned alongside this one in `voice_transcripts.llm_result.entities_mentioned`. Catches discussed-but-not-yet-anchored entities.
+
+Prompt constraint: enrichment never asserts facts the user didn't capture. Wikidata properties become retrieval prompts ("you captured X reigned Y-Z; who succeeded?"), not assertions. 8 new tests.
+
+### Stretch UX (commit `39c83b2`)
+
+- **Entity badge**: `entity_capture` origin now shows 💬 (unresolved) or 🔷 (Wikidata-linked) in the stream header, distinct from existing 📖/🎙/👤 badges.
+- **About-this-card source excerpts**: "VOICE CAPTURE" section shows `knowledge_entities.sources[].source_text` + capture_id. "WIKIDATA" section shows QID when resolved. `generate_review_stream()` now passes entity-path sources through to provenance instead of empty `[]`.
+- **Entity intro cards**: `_build_entity_capture_intros()` inserts an entity_intro card before the first review of never-graded entity_capture items when `shared_entities` has a description ≥20 chars.
+
+### Gemini Date Coercion Fix (commit `0a3a304`)
+
+Pre-existing latent bug surfaced during backfill: Gemini occasionally returns `date_start`/`date_end` as strings ("1682") in JSON-mode responses. `_resolve_voice_entities_background` passed these through to `DateRange(start=str)`, crashing inside the resolver with `'<' not supported between instances of 'int' and 'str'`. Added `_coerce_year()` helper that defensively parses int/float/str/None.
+
+### Backfill + End-to-End Validation
+
+Deployed via `bash ~/src/petrarca/scripts/deploy.sh` (rsyncs limbic AND git-pulls petrarca). Re-ran resolution on Karl XII and Viking Paris captures:
+- **Karl XII → Q52934** (Carl XII of Sweden) — regnal spelling retry successful. 12/12 mentions resolved.
+- **Count Odo → ambiguous** with reason "weak structural match (type=0.30, date=0.00)" — downgrade fired. Hallucination guard then rejected LLM's Q312674 proposal. Correctly stays unresolved.
+
+Regenerated Battle of Poltava `cached_question` with Phase 2 enrichment. Memory hook changed from generic ("1709 famine, Great Frost") to graph-grounded ("nine years after Karl XII's victory at Narva in 1700 — Poltava reversed their fortunes completely"). References Battle of Narva (scoped temporal neighbor) and Karl XII (voice co-occurrence). North-star validated.
+
+### Commits
+- `e7d8498` (limbic) — Regnal spelling variants + weak-match downgrade (12 new tests)
+- `08c4551` — Phase 2 entity-graph enrichment (8 new tests)
+- `39c83b2` — Stretch UX: badge + source excerpts + entity intro cards
+- `0a3a304` — Gemini date coercion fix
+
+## Session 77: Entity-First Phase 1 Observation + Cleanup Fixes (April 15, 2026)
+
+### Observation Phase (Priority 0)
+Per the Session 77 prompt, the session began with an observation pass against production state — no code until the data was read. Inspection scripts were scp'd to alif and run against `/opt/petrarca/data/petrarca.db`. 11 `knowledge_entities` rows + 2 entity-path voice transcripts (Karl XII `vt_1776272899_7705`, Viking Paris `vt_1776274698_7861`) were small enough to enumerate fact-by-fact rather than sample.
+
+**What worked well in Phase 1:**
+- Question quality is genuinely strong. Memory hooks anchored Karl XII to Peter the Great's 1697 Grand Embassy, the 1708 Russian campaign to Napoleon's 1812 Moscow disaster (104 years apart), Charles the Fat's 886 humiliation to the 843 Treaty of Verdun. Match north-star principle 6 (temporal hooks).
+- Entity grouping from `VOICE_CAPTURE_ENTITY_PROMPT` was sensible: 5 entities from Karl XII transcript, 6 from Viking Paris. No over-splitting (each date its own entity) or under-splitting (one giant container).
+- All 11 entity items appeared correctly in `generate_review_stream()` with `knowledge_weight=6.0` and proper FSRS scheduling. Karl XII graded `knew` → rescheduled +26.9d with stability 8.3d via the existing curriculum-grading codepath.
+
+**Bugs found:**
+1. **Double Wikidata resolution fire.** Every mention from entity-path captures had exactly 2 rows in `entity_resolutions` — 17 mentions → 34 rows on Karl XII capture. Root cause: when `process_voice_capture()` falls through to `_process_voice_capture_entity_path()` at line 4991, the entity path fires its own resolution thread, then control returns and the curriculum-path thread fires AGAIN at line 5026 with the same `entities_mentioned` list.
+2. **`voice_transcripts.node_title` carried curriculum garbage.** Karl XII transcript was logged as `node_title='1693 Earthquake'`; Viking Paris as `'Charles Ives'`. Caused by the entity path inheriting curriculum-path's loose-name-match fallback.
+3. **Karl XII Wikidata resolution failed**: search returned only paintings (Q119811370 by Schröder, Q106357900 by Ankarcrona). The actual person is Q52934 labeled "Carl XII of Sweden" — verified by direct `wbsearchentities` calls. The English spelling "Karl XII" isn't an alias on Q52934.
+4. **"Count Odo" mapped to Q67389525 "Count Ödön Széchenyi Fire Brigade Museum"** in Istanbul. Resolver accepted single candidate at `total=0.596 type=0.30 date=0.00` because it crossed the 0.55 threshold — no LLM disambiguation ran (only fires on `ambiguous` status).
+
+**Design gaps:**
+- A. Entity cards had `follow_up_queries: []` because `generate_entity_question` only called `_key_fact_to_question` (which generates rich_answer + memory_hook) but not `_generate_follow_up_queries`.
+- B. `entity_type` defaulted to literal `"entity"` because the prompt didn't ask for type classification and `shared_entities.entity_type` was rarely populated yet.
+- C. Parentheticals and honorifics on entity names broke Wikidata search: "Viking siege of Paris (885-886)", "Emperor Charles the Fat", "Russian Campaign (1708-1709)" all returned `no_match` or wrong matches.
+
+**Findings written to `research/session-77-observations.md`** before any code change.
+
+### Fixes Shipped (commit `5bb9e88`)
+- **Bug 1 fix**: added `entity_path_triggered` flag in `process_voice_capture()`; the curriculum-path resolution thread is skipped when entity path took over. Eliminates 2× Gemini extraction + Wikidata search per fallback capture.
+- **Bug 2 fix**: `_log_voice_transcript` inside `_process_voice_capture_entity_path` now prefers `next(iter(entity_facts.keys()))` (the LLM's primary entity) over the curriculum-path's `entity_name` arg.
+- **Gap A fix**: `generate_entity_question` now calls `_generate_follow_up_queries` after `_key_fact_to_question`, passing `entity_name` as `node_title` and the picked fact's question/answer as `fact_context`.
+- **Gap B fix**: added `entity_types` field to `VOICE_CAPTURE_ENTITY_PROMPT` output (one of `person|place|event|battle|dynasty|work|organization|concept`); threaded through entity creation so `knowledge_entities.entity_type` carries the LLM classification when no `shared_entities` row exists.
+- **Gap C fix**: added explicit CANONICAL NAMING block to the prompt with BAD/GOOD examples — strip parenthetical date qualifiers, strip honorifics unless part of canonical name (keeps "Pope Gregory VII", "Count Odo of Paris"), prefer common English spellings ("Karl" over "Carl").
+- **Backfill**: ran a one-shot script against the 11 existing `knowledge_entities` rows to regenerate `cached_question` so they pick up follow_up_queries. All 11 got 6 follow-ups each. Quality sample for Karl XII: *Voltaire's 1731 History of Charles XII, Baltic German Livonian nobility, Johann Reinhold Patkul, Swedish copper industry*. These follow north-star principle 11 — sideways, not deeper.
+
+### Verified Live
+- `petrarca-research` restarted cleanly. `POST /curriculum/review/generate` returns entity items with 6 follow-ups now exposed as top-level field on each card.
+
+### Deferred to Session 78 / Priority 2 (Resolver-Level Work)
+- **Bug 3 — Karl XII spelling**: Wikidata search returns only paintings for "Karl XII of Sweden" because Q52934's English label is "Carl XII of Sweden". Requires limbic-level fix: alternate-spelling retry for regnal names (Karl/Carl/Charles, Frederick/Friedrich/Friedrich), or upstream Wikidata alias contribution.
+- **Bug 4 — Count Odo → Fire Brigade Museum**: resolver accepted a single candidate with `type_score < 0.5 AND date_score < 0.5`. Fix: require LLM disambiguation when both type and date scores are weak, even on single-candidate matches.
+
+### Commits
+`5bb9e88` (all four fixes + observations doc).
+
+## Session 76: Entity-First Architecture Phase 1 + Production Fixes (April 14–15, 2026)
+
+### Production Fixes (deployed first)
+- **`STRUCTURAL_ONLY=True` was live** from Session 75 testing — blocked ALL SR and ML cards from the review stream. Only 6 structural cards were being served to the client. Reverted to `False` in `curriculum_db.py:936`.
+- **Gemini API key not persisted across server restarts** — the systemd unit lacked `EnvironmentFile=/opt/petrarca/.env`. Added it; 178 pending ML cards can now complete.
+
+### The Architectural Question
+User reported: voice captures about topics outside existing curricula (Iran podcast, Rollo/Normans book) produced nothing useful. Traced to the `knowledge_items` table requiring `curriculum_domain NOT NULL` + `curriculum_node_id NOT NULL` — every knowledge tracking flow depends on mapping to a curriculum node first. For genuinely novel topics there is no such node.
+
+Research: re-read `overlapping-curricula-vision.md`, `curriculum-system-audit.md`, `entity-profiles-design.md`. The Session 54 audit already asked "what if no curricula?" and identified curriculum's genuine value (gap analysis, bounded review, progress visualization) vs. its accidental coupling (deduplication, knowledge tracking, voice capture routing).
+
+Wikidata QIDs are strictly better for deduplication than curriculum nodes: `Q155124` is Roger II everywhere, whereas `sicily:roger_ii` and `medieval_europe:roger_ii` are two separate rows today.
+
+Decision: invert the dependency. Entities become the primary knowledge unit; curricula remain as optional overlays for gap analysis and structured review.
+
+### Design Doc
+**`research/entity-first-architecture.md`** (new) — 5-phase migration plan with full dependency audit.
+
+### Phase 1 Shipped
+- **New `knowledge_entities` table** in `db.py` (schema + migration). Same FSRS/cached_question/key_facts shape as `knowledge_items`, keyed by entity slug (`ent:{slug}`).
+- **`VOICE_CAPTURE_ENTITY_PROMPT`** in `review_engine.py` — outputs `entity_facts` grouped by entity name with `{id, question, answer, type, source_excerpt}` format (compatible with `_pick_key_fact()` / `_key_fact_to_question()`).
+- **`_process_voice_capture_entity_path()`** in `review_engine.py` — fires when (a) no candidate curriculum nodes, or (b) curriculum LLM returns `node_assessments=[]`. Creates/updates `knowledge_entities` rows, pre-generates cached_questions, triggers ML cards from wonderings, logs transcript, triggers background Wikidata resolution.
+- **`generate_entity_question()`** reuses `_pick_key_fact()` + `_key_fact_to_question()` — entity_name substitutes for node_title, `shared_entities.description` (if linked) for node_description. No curriculum context needed.
+- **`generate_question()` fallthrough** — if item_id is not in `knowledge_items` or `review_items`, checks `knowledge_entities` and delegates.
+- **`record_answer()` lookup** — added `knowledge_entities` after `microlearning_quizzes`. Existing `curriculum_domain` guards naturally skip knowledge_state updates and dependent rescheduling (entity items have neither).
+- **Review stream integration** in `curriculum_db.py` `generate_review_stream()` — queries `knowledge_entities` with `knowledge_weight=6.0`, sets pseudo-fields (`curriculum_domain='entity'`, `node_title=entity_name`, `domain_title=entity_type.title()`) so entity items render through the existing `ReviewCard` as `type:'review'` with `provenance.origin='entity_capture'`. Entity items' own `key_facts` surface as `related_facts`.
+- **Wikidata backfill** — `_resolve_voice_entities_background()` now calls a `_link_ke()` helper after creating/updating `shared_entities` to update matching `knowledge_entities` rows with `entity_id` and `wikidata_qid`.
+
+### Validation (real captures)
+- **Karl XII of Sweden** (novel, no curriculum): 5 entity items — Karl XII, Battle of Narva, Great Northern War, Russian Campaign, Battle of Poltava. Narva auto-linked to Q155726, Poltava to Q152486. Memory hook: *"Karl XII became king the same year Peter the Great returned from his Great Embassy to Western Europe (1697-98)."*
+- **Viking siege of Paris 885-886**: 6 entity items — siege, Count Odo, Charles the Fat, Abbo of Saint-Germain, Sigfred, Rollo. Memory hook: *"This 885-886 siege came just 73 years after Charlemagne's death in 814."*
+- **Aztec Empire test**: correctly routed to AP World History curriculum (not entity path) — expected behavior, curriculum wins when it exists.
+- **Grading**: `POST /curriculum/review/result` with `ent:karl_xii_of_sweden` / `knew` → `stability_days=8.3` (FSRS Easy rating), due 2026-05-12. Confirmed FSRS scheduling works on entity items.
+
+### Bug Fixes During Testing
+- **Entity path wasn't triggering** because Gemini Flash domain routing always found SOME candidate nodes (even weak ones). Widened entry point to also fire when curriculum LLM analysis returns `node_assessments=[]`. Replaces the old weak ML-card novel-topic fallback.
+- **`database is locked` during pregen** — background thread held an open connection during the slow Claude enrichment call. Refactored per CLAUDE.md write-lock discipline: read → close → slow Claude call → open → write. Each entity gets its own conn per phase.
+
+### Explicitly Not Touched
+- Existing `knowledge_items` curriculum flows continue unchanged
+- `knowledge_states` table unchanged
+- Structural cards remain curriculum-only
+- Voice elicitation remains curriculum-based
+- No client changes — entity items render as `type:'review'` through existing `ReviewCard`
+
+### Commits
+`0f83650` (core), `c975c7d` (entity path fallback widened), `a8b27b6` (write-lock discipline).
 
 ## Session 75: Activation Gating + Voice Pipeline + Auth Fix (April 14, 2026)
 

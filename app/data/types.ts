@@ -530,7 +530,7 @@ export interface MicrolearningQuiz {
 }
 
 export interface ResurfacingItem {
-  type: 'review' | 'microlearning' | 'microlearning_quiz' | 'entity_intro' | 'resonance' | 'dialogue' | 'retrieval' | 'temporal_ordering' | 'aspect' | 'sequence';
+  type: 'review' | 'microlearning' | 'microlearning_quiz' | 'entity_intro' | 'resonance' | 'dialogue' | 'retrieval' | 'temporal_ordering' | 'aspect' | 'sequence' | 'synchronic' | 'cast' | 'causal';
   // Review card fields (from knowledge_items)
   title?: string;  // prominent card title (with dates)
   question_id?: string;
@@ -560,7 +560,7 @@ export interface ResurfacingItem {
   node_confidence?: number;
   // Provenance — origin, scheduling, and scoring data for "About this card"
   provenance?: {
-    origin: string;  // 'book_chapter' | 'book_whole' | 'gap_fill' | 'voice_wondering' | 'follow_up' | 'entity_research' | 'user_request' | 'unknown'
+    origin: string;  // 'book_chapter' | 'book_whole' | 'gap_fill' | 'voice_wondering' | 'follow_up' | 'entity_research' | 'entity_capture' | 'user_request' | 'unknown'
     is_gap_fill?: boolean;
     stream_score?: number;
     schedule_reason?: string;  // 'never_reviewed' | 'overdue' | 'due_soon' | 'not_due'
@@ -568,13 +568,18 @@ export interface ResurfacingItem {
     knowledge_weight?: number;
     fact_type_adj?: number;
     sources?: Array<{
+      // Book-chapter/whole-book source shape:
       book_id?: string;
       chapter_number?: number;
       chapter_title?: string;
-      source_text?: string;
       lens?: string;
-      added_at?: string;
       confidence?: number;
+      // Voice-capture source shape (entity_capture items):
+      source?: string;          // 'voice_capture' | 'voice_elicitation'
+      capture_id?: string;      // voice_transcripts.id
+      // Shared fields:
+      source_text?: string;
+      added_at?: string | number;
     }>;
     source_item_id?: string;
     source_node_id?: string;
@@ -582,6 +587,9 @@ export interface ResurfacingItem {
     created_at?: number;
     due_at?: number;
     last_reviewed_at?: number;
+    // Entity-capture provenance:
+    entity_id?: string;
+    wikidata_qid?: string;
   };
   // Entity annotation (from server entity matching)
   entity_spans?: Record<string, EntitySpan[]>;

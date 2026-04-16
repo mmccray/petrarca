@@ -4061,7 +4061,8 @@ JSON array only:"""
                 log_interaction('review_answer', item_id=question_id, score=mapped_result,
                                 card_type=body.get('card_type'),
                                 new_stability=resp.get('new_stability_days'),
-                                next_due=resp.get('next_due_at'))
+                                next_due=resp.get('next_due_at'),
+                                response_time_ms=body.get('response_time_ms'))
                 self._send_json_response(200, {'status': 'recorded', **resp})
             else:
                 self._send_json_response(404, {'error': f'item {question_id} not found'})
@@ -4939,6 +4940,73 @@ JSON array only:"""
     # every ambiguous / no_match / merge-candidate resolution is queued here
     # for user triage.
     # --------------------------------------------------------------------
+
+    def _handle_admin_suggested_cards(self):
+        """GET /admin/suggested-cards — JSON list of voice-detected card suggestions."""
+        from db import get_connection
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        status_filter = params.get('status', ['pending'])[0]
+
+        conn = get_connection(readonly=True)
+        query = "SELECT * FROM suggested_cards"
+        args = []
+        if status_filter != 'all':
+            query += " WHERE status = ?"
+            args.append(status_filter)
+        query += " ORDER BY created_at DESC LIMIT 100"
+
+        rows = conn.execute(query, args).fetchall()
+        conn.close()
+
+        result = []
+        for r in rows:
+            result.append({
+                'id': r['id'],
+                'card_type': r['card_type'],
+                'source_transcript_ids': json.loads(r['source_transcript_ids']) if r['source_transcript_ids'] else [],
+                'entities': json.loads(r['entities']) if r['entities'] else [],
+                'domain_ids': json.loads(r['domain_ids']) if r['domain_ids'] else [],
+                'rationale': r['rationale'],
+                'status': r['status'],
+                'created_at': r['created_at'],
+            })
+
+        return self._send_json_response(200, {'suggestions': result, 'count': len(result)})
+
+    def _handle_admin_suggested_cards_update(self):
+        """POST /admin/suggested-cards/approve or /reject — update suggestion status."""
+        body = self._read_json_body()
+        if body is None:
+            return
+        suggestion_id = body.get('id')
+        if not suggestion_id:
+            return self._send_json_response(400, {'error': 'Missing id'})
+
+        new_status = 'approved' if '/approve' in self.path else 'rejected'
+
+        from db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute('SELECT id, status FROM suggested_cards WHERE id = ?',
+                               (suggestion_id,)).fetchone()
+            if not row:
+                return self._send_json_response(404, {'error': f'Suggestion {suggestion_id} not found'})
+
+            conn.execute('UPDATE suggested_cards SET status = ? WHERE id = ?',
+                         (new_status, suggestion_id))
+            conn.commit()
+            print(f'[suggested-cards] {suggestion_id}: {row["status"]} → {new_status}', flush=True)
+            return self._send_json_response(200, {
+                'id': suggestion_id, 'status': new_status,
+                'message': f'Suggestion {new_status}',
+            })
+        except Exception as e:
+            print(f'[suggested-cards] Error: {e}', flush=True)
+            return self._send_json_response(500, {'error': str(e)})
+        finally:
+            conn.close()
 
     def _handle_admin_entity_queue_data(self):
         """GET /admin/entity-queue-data — JSON list of resolutions needing review."""
@@ -6440,6 +6508,17 @@ JSON array only:"""
         finally:
             conn.close()
 
+    def _handle_native_stats(self):
+        """GET /stats/native — statistics for the native Stats tab."""
+        from curriculum_db import get_native_stats
+        from db import get_connection
+        conn = get_connection(readonly=True)
+        try:
+            data = get_native_stats(conn=conn)
+            self._send_json_response(200, data)
+        finally:
+            conn.close()
+
     def _serve_html_file(self, filename: str):
         html_path = Path(__file__).parent / filename
         if not html_path.exists():
@@ -6625,6 +6704,8 @@ JSON array only:"""
             return self._handle_review_answer()
         if self.path == '/structural/grade':
             return self._handle_structural_grade()
+        if self.path in ('/admin/suggested-cards/approve', '/admin/suggested-cards/reject'):
+            return self._handle_admin_suggested_cards_update()
         if self.path == '/review/explore':
             return self._handle_review_explore()
         if self.path == '/review/voice-memo':
@@ -7203,6 +7284,8 @@ JSON array only:"""
             return self._handle_admin_entity_queue_data()
         if self.path.startswith('/admin/entity/Q'):
             return self._handle_admin_entity_detail()
+        if self.path.startswith('/admin/suggested-cards'):
+            return self._handle_admin_suggested_cards()
         if self.path.startswith('/curriculum/review/timeline/'):
             domain_id = self.path.split('/curriculum/review/timeline/')[1].split('?')[0]
             return self._send_json_response(200, {'timeline': get_timeline(domain_id)})
@@ -7248,6 +7331,8 @@ JSON array only:"""
             return self._serve_html_file('statistics_dashboard.html')
         if self.path == '/stats/dashboard-data':
             return self._handle_dashboard_stats()
+        if self.path == '/stats/native':
+            return self._handle_native_stats()
         if self.path == '/research/elicitation-analysis':
             return self._serve_html_file('knowledge_elicitation_analysis.html')
         if self.path == '/knowledge/growth':

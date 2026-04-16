@@ -4,6 +4,22 @@
 
 ---
 
+## 2026-04-16 — Session 81: FSRS Optimizer Baseline
+
+**What**: Ran py-fsrs Optimizer on 195 review events across 106 cards (56 with 2+ reviews).
+**Result**: 0.0% improvement over default FSRS-6 parameters. Loss: 0.433949 for both default and optimized.
+**Interpretation**: Insufficient data for meaningful optimization — need cards with longer review histories (5+ reviews per card). Current 26 items with 3+ reviews are too few.
+**Next step**: Re-run at 500+ grading events. Script: `scripts/optimize_fsrs.py`
+
+## 2026-04-16 — Session 81: Collateral Exposure Tracking (E3 Setup)
+
+**What**: Anchor positions on structural cards now receive 30% of normal FSRS stability credit when visible but not tested.
+**Hypothesis (E3)**: Facts seen as anchors will be recalled better on their next active test than facts with no exposure.
+**Measurement plan**: After 2 weeks, compare retention rates of collateral-exposed vs unexposed positions.
+**Implementation**: `record_structural_answer()` in `review_engine.py` — processes all non-graded positions for the card.
+
+---
+
 ## 2026-03-10 — Session 15b: Universal Feedback Capture with Screenshots + Server Upload
 
 **What**: Upgraded the floating ✦ feedback button from local-only text/voice to a full feedback pipeline with automatic screenshots, server upload, and rich context detection.

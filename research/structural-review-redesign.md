@@ -608,12 +608,12 @@ The existing tables remain. New tables are additive. The migration path:
 
 ## Implementation Sequence
 
-### Phase 0: Foundation (this session + next)
-- [ ] Write this design document (done)
-- [ ] Update CLAUDE.md with disabled features
-- [ ] Reprocess Rollo transcript through full pipeline (validate voice→knowledge flow)
-- [ ] Consider reprocessing all voice transcripts through updated pipeline
-- [ ] Merge Wikidata entity resolution work (PR #2 + backfill)
+### Phase 0: Foundation (Session 71 — done)
+- [x] Write this design document (done)
+- [x] Update CLAUDE.md with disabled features
+- [x] Reprocess Rollo transcript through full pipeline (validate voice→knowledge flow)
+- [x] Reprocess all voice transcripts through updated pipeline (Session 82: 6/6 resolved, 29 new entities)
+- [x] Merge Wikidata entity resolution work (PR #2 + backfill)
 
 ### Phase 1: Review-First App Shell (Session 72 — partially done)
 - [x] Restructure navigation: 4 tabs initially (Review, Voice, Stats, More)
@@ -647,12 +647,13 @@ The existing tables remain. New tables are additive. The migration path:
 - [ ] Aspect-specific mnemonic generation (different strategy per type)
 - [ ] Trust line: "3/4 known. 'What year?' due Thursday"
 
-### Phase 3: Quick Quiz Cards
-- [ ] Build QuickQuizCard component (fast, binary, mini-context bar)
-- [ ] Migrate existing microlearning_quizzes to quick quiz format
-- [ ] Generate quick quiz variants (position, order, gap, simultaneous, role, causal)
-- [ ] Integrate into review stream as primary card type
-- [ ] Session composition logic: mix structural + quick quiz cards
+### Phase 3: Quick Quiz Cards (Session 80 — partially done)
+- [x] Generate quick quiz variants: date_reverse(414), order(16), role(427), causal(2,224), location(249) — 4,724 total via `generate_quick_quizzes.py`
+- [x] Integrate into review stream (interleaved by `_mix_structural_cards()`)
+- [x] Session rhythm: structural→quiz→review→review→quiz "palate cleanser" pattern
+- [x] Response time tracking with subtle timer indicator
+- [ ] Build dedicated QuickQuizCard component (currently uses MicrolearningQuizCard)
+- [ ] Trust line on aspect cards: "3/4 known. 'What year?' due Thursday"
 
 ### Phase 4: Sequence Cards (Session 74 — done)
 - [x] Define sequence boundaries per domain (LLM-assisted via `generate_sequence_cards.py`)
@@ -666,36 +667,38 @@ The existing tables remain. New tables are additive. The migration path:
 - [ ] Scale annotations (temporal proportion, duration comparisons)
 - [ ] Knowledge-gating: require ≥3 known positions before showing a sequence card
 
-### Phase 5: Synchronic Cards
-- [ ] Cross-domain entity query (using Wikidata date ranges)
-- [ ] Anchor year selection from significant events
-- [ ] Build SynchronicCard component (schematic geographic layout)
-- [ ] Anchor selection based on user knowledge state
-- [ ] Cross-domain hook generation
-- [ ] Integrate into review stream
+### Phase 5: Synchronic Cards (Session 79 — done)
+- [x] Cross-domain entity query (using Wikidata date ranges)
+- [x] Anchor year selection from significant events
+- [x] Build SynchronicCard component (schematic geographic layout)
+- [x] 10 synchronic cards, 48 positions, 734 BC–1194 AD
+- [x] Anchor selection based on user knowledge state (≥5 KI in anchor domain)
+- [x] Cross-domain hook generation
+- [x] Integrate into review stream
 
-### Phase 6: Additional Card Types
-- [ ] Cast cards (people + roles around events)
-- [ ] Causal chain cards
-- [ ] Transformation cards (before/after)
+### Phase 6: Additional Card Types (Session 80 — done)
+- [x] Cast cards: 25 cards, 81 positions. Person-in-role identification with question variants.
+- [x] Causal chain cards: 14 cards, 63 positions. Why-testing with connection visibility logic.
+- [ ] Transformation cards (before/after) — deferred
 
-### Phase 7: Analytics & Scheduling
-- [ ] Build native Stats screen (React Native, no D3)
-- [ ] Exposure log table + tracking
-- [ ] Collateral exposure credit (0.3× FSRS weight)
+### Phase 7: Analytics & Scheduling (Sessions 80-81 — partially done)
+- [x] Build native Stats screen (React Native, no D3) — progress bars, knowledge levels, heatmap, score distribution
+- [x] Collateral exposure credit (0.3× FSRS weight via `record_structural_answer()`)
+- [x] Leech detection + auto-suspend at 7 consecutive misses (30-day suspension, clear cached_question)
+- [x] Raise maximum_interval to 3650
+- [x] FSRS optimizer script (`optimize_fsrs.py`) — 195 events, 0% improvement (re-run at 500+)
+- [ ] Exposure log table + tracking (beyond collateral)
 - [ ] Implicit review credit (FIRe-inspired encompassing graph)
 - [ ] Dependency tracking between facts
-- [ ] Leech detection + graduated suspension
-- [ ] Raise maximum_interval to 3650
 - [ ] Anchor calibration (verification checks, effectiveness tracking)
-- [ ] FSRS optimizer script (calibrate from interaction_log)
 
-### Phase 8: Voice Enhancements
+### Phase 8: Voice Enhancements (Session 82 — partially done)
 - [ ] Priority boost for fresh voice captures
-- [ ] Auto-detect sequences in voice transcripts → generate sequence cards
-- [ ] Auto-detect contemporaneous mentions → generate synchronic cards
-- [ ] Batch reprocess historical transcripts through updated pipeline
+- [x] Auto-detect sequences in voice transcripts → `detect_card_suggestions.py` (2 suggestions found)
+- [x] Auto-detect contemporaneous mentions → same script (0 found — entities within transcripts tend to be same-domain)
+- [x] Batch reprocess historical transcripts → `reprocess_all_transcripts.py` (6/6 resolved, 29 new entities)
 - [ ] Voice capture from Review tab (floating mic → quick capture)
+- [ ] Auto-generate structural cards from high-confidence suggestions
 
 ## Simulation: Coverage & Learning Over Time (user request)
 

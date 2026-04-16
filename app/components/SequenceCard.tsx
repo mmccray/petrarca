@@ -11,6 +11,7 @@ interface SequencePosition {
   mnemonic?: string;
   year?: number;
   year_display?: string;
+  scale_to_next?: string;
   stability_days: number;
   due_at: number;
   review_count: number;
@@ -65,6 +66,13 @@ function formatYear(year?: number, display?: string): string {
   if (year == null) return '?';
   if (year < 0) return `${Math.abs(year)} BC`;
   return `${year} AD`;
+}
+
+function formatGap(yearA?: number, yearB?: number): string | null {
+  if (yearA == null || yearB == null) return null;
+  const gap = Math.abs(yearB - yearA);
+  if (gap < 5) return null;
+  return `${gap} years`;
 }
 
 export default function SequenceCard({ card, onComplete }: Props) {
@@ -248,6 +256,17 @@ export default function SequenceCard({ card, onComplete }: Props) {
                 {p.mnemonic && state !== 'blank' && (
                   <Text style={st.hookText}>{p.mnemonic}</Text>
                 )}
+
+                {/* Scale annotation — gap to next milestone */}
+                {!isLast && (() => {
+                  const next = positions[i + 1];
+                  const gap = formatGap(p.year, next?.year);
+                  if (!gap) return null;
+                  const label = p.scale_to_next
+                    ? `${gap} \u2014 ${p.scale_to_next}`
+                    : gap;
+                  return <Text style={st.gapLabel}>{'\u2014'} {label} {'\u2014'}</Text>;
+                })()}
               </View>
             </View>
           );
@@ -340,6 +359,7 @@ const st = StyleSheet.create({
 
   // Hook annotation
   hookText: { fontFamily: fonts.readingItalic, fontSize: 11, color: colors.textMuted, marginTop: 2, opacity: 0.8, ...webItalic },
+  gapLabel: { fontFamily: fonts.ui, fontSize: 10, color: colors.textMuted, opacity: 0.5, marginTop: 6, letterSpacing: 0.5 },
 
   // Summary
   summaryRow: { marginTop: 12, paddingTop: 12, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.rule },

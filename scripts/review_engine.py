@@ -61,7 +61,7 @@ _fsrs_scheduler = _FsrsScheduler(
     learning_steps=(),          # Skip — daily review app, not per-minute
     relearning_steps=(),        # Skip — same reason
     enable_fuzzing=True,
-    maximum_interval=365,
+    maximum_interval=3650,
 )
 
 SCORE_TO_FSRS = {
@@ -505,6 +505,49 @@ Output JSON:
 "entities_mentioned": ["entity name 1", "entity name 2"],
 "confidence_tagged": [{{"fact": "specific claim", "confidence": "certain|uncertain|wrong"}}],
 "overall_summary": "2-3 sentence summary of what the learner shared"}}"""
+
+
+VOICE_CAPTURE_ENTITY_PROMPT = """Analyze a voice capture where a learner describes what they know about a topic.
+This is NOT a recall test — the learner is freely sharing knowledge from a podcast, book, conversation, or their own thinking.
+No curriculum structure exists for this topic. Your job is to extract concrete, testable facts organized by the main entities (people, places, events) being discussed.
+
+{context_section}
+
+{entity_info}
+
+LEARNER'S VOICE CAPTURE (transcribed speech):
+{transcript}
+
+Instructions:
+1. Identify the primary ENTITIES discussed: people, places, events, or specific concepts.
+2. Group facts by entity. For each entity, extract every concrete, testable FACT into a question-answer pair suitable for spaced repetition review:
+   - Each fact MUST have a specific question with a definite answer. BAD: "What happened?" GOOD: "In what year did Rollo's Vikings besiege Paris?"
+   - "type" classifies the fact: "date" (when), "event" (what happened), "person" (who), "place" (where), "concept" (what/how), "cause" (why), "significance" (why it matters)
+   - "source_excerpt" is 1-2 sentences quoted from the transcript that support this fact
+3. Be thorough — include dates, names, causal claims, and connections. Aim for 3-8 facts per main entity.
+4. Extract ALL wonderings, speculative statements, "I think...", "I'm not sure if..." — rephrase as clear research questions.
+5. Tag each factual claim with confidence: "certain" (stated as fact), "uncertain" (hedged), "wrong" (stated confidently but incorrect).
+6. List all entities mentioned (even if they don't have associated facts).
+7. For each entity discussed OR mentioned, classify its type as one of: "person", "place", "event", "battle", "dynasty", "work", "organization", "concept". Include this in "entity_types".
+8. Provide an overall_summary (2-3 sentences).
+
+CANONICAL NAMING — critical for downstream Wikidata resolution:
+- Use canonical Wikidata-style names. Prefer the form most likely to match a Wikidata label.
+- STRIP parenthetical qualifiers. BAD: "Siege of Paris (885-886)"; GOOD: "Siege of Paris". BAD: "Russian Campaign (1708-1709)"; GOOD: "Russian campaign of Charles XII".
+- STRIP honorifics and titles unless they are part of the canonical name. BAD: "Emperor Charles the Fat"; GOOD: "Charles the Fat". BAD: "King Karl XII of Sweden"; GOOD: "Karl XII of Sweden". But KEEP: "Pope Gregory VII" (title is canonical), "Count Odo of Paris" (disambiguation).
+- For rulers with common English variants, prefer the most common English form. BAD: "Carl XII"; GOOD: "Karl XII of Sweden".
+- This naming rule applies to BOTH the keys of entity_facts AND the entries in entities_mentioned AND the keys of entity_types.
+
+Output JSON:
+{{"entity_facts": {{
+    "Entity Name 1": [{{"id": "f1", "question": "specific question", "answer": "concise answer", "type": "date|event|person|place|concept|cause|significance", "source_excerpt": "..."}}],
+    "Entity Name 2": [{{"id": "f2", "question": "...", "answer": "...", "type": "...", "source_excerpt": "..."}}]
+  }},
+  "entity_types": {{"Entity Name 1": "person|place|event|battle|dynasty|work|organization|concept", "Entity Name 2": "..."}},
+  "wonderings": ["research question 1", "research question 2"],
+  "entities_mentioned": ["entity name 1", "entity name 2"],
+  "confidence_tagged": [{{"fact": "specific claim", "confidence": "certain|uncertain|wrong"}}],
+  "overall_summary": "2-3 sentence summary"}}"""
 
 
 HAMARQUIZEN_PROMPT = """Generate a Hamarquizen-style micro-lesson for reviewing a book topic.
@@ -1284,7 +1327,7 @@ Short answer: {answer}
 
 {learner_context}
 
-If learner context is provided, personalize the memory hook using connections the
+{entity_graph_context_block}If learner context is provided, personalize the memory hook using connections the
 learner has already made. Reference their known temporal anchors rather than generic ones.
 
 Generate:
@@ -1297,9 +1340,36 @@ Output JSON only:
 {{"rich_answer":"...","memory_hook":"..."}}"""
 
 
+# Wrapper block header used only when entity_graph_context is non-empty.
+# Keeping it as a separate constant lets the prompt remain readable when
+# there's no graph context to inject (block is omitted entirely, not left
+# as a labeled-but-empty section).
+_ENRICH_ENTITY_GRAPH_BLOCK = """Entity graph context (from the learner's own captures and Wikidata):
+{entity_graph_context}
+
+Use this context to GROUND the memory_hook in what the learner already knows.
+STRICT RULE: Do NOT assert facts that don't appear in the "Short answer", the
+"Topic description", or the learner's captured facts. Wikidata properties are
+hints for ANCHORS, not license to introduce new claims.
+
+When Wikidata properties suggest a natural follow-up fact (e.g. succession,
+family), frame it as a RETRIEVAL PROMPT — "do you remember who succeeded
+him?" — not as an assertion.
+
+"""
+
+
 def _key_fact_to_question(fact: dict, node_title: str, node_description: str,
-                          conn=None, node_id=None, domain_id=None) -> dict:
-    """Convert a key_fact to the cached_question format, with LLM enrichment."""
+                          conn=None, node_id=None, domain_id=None,
+                          entity_graph_context: str = '') -> dict:
+    """Convert a key_fact to the cached_question format, with LLM enrichment.
+
+    `entity_graph_context` is the Phase 2 entity-first enrichment block
+    (Wikidata properties + scoped temporal neighbors + voice co-occurrence),
+    built by `_format_entity_graph_context`. Empty string for curriculum-path
+    callers — the prompt block is omitted in that case, keeping behaviour
+    identical to Phase 1.
+    """
     result = {
         'question': fact['question'],
         'answer_guidance': fact['answer'],
@@ -1315,6 +1385,12 @@ def _key_fact_to_question(fact: dict, node_title: str, node_description: str,
     if conn and node_id and domain_id:
         learner_ctx = get_learner_context(node_id, domain_id, conn)
 
+    egc_block = (
+        _ENRICH_ENTITY_GRAPH_BLOCK.format(entity_graph_context=entity_graph_context)
+        if entity_graph_context.strip()
+        else ''
+    )
+
     # Enrich bare answers with narrative + memory hook
     try:
         enriched = call_claude_json(_ENRICH_PROMPT.format(
@@ -1323,6 +1399,7 @@ def _key_fact_to_question(fact: dict, node_title: str, node_description: str,
             question=fact['question'],
             answer=fact['answer'],
             learner_context=learner_ctx,
+            entity_graph_context_block=egc_block,
         ), timeout=90, model='sonnet')
         if enriched and isinstance(enriched, dict):
             if enriched.get('rich_answer'):
@@ -1437,10 +1514,19 @@ def _get_temporal_cross_references(domain_id: str, node_id: str, conn) -> str:
 
 
 def generate_question(item_id: str, conn) -> dict:
-    # First try knowledge_items (node-centric); fall back to review_items (exploration/voice)
+    # First try knowledge_items (node-centric); fall back to review_items (exploration/voice);
+    # finally knowledge_entities (entity-keyed, no curriculum)
     row = conn.execute('SELECT * FROM knowledge_items WHERE id=?', (item_id,)).fetchone()
     if row is None:
         row = conn.execute('SELECT * FROM review_items WHERE id=?', (item_id,)).fetchone()
+    if row is None:
+        # Entity-keyed items — delegate to the entity question generator
+        try:
+            ke_row = conn.execute('SELECT id FROM knowledge_entities WHERE id=?', (item_id,)).fetchone()
+            if ke_row:
+                return generate_entity_question(item_id, conn)
+        except Exception:
+            pass
     if not row:
         return {}
     item = dict(row)
@@ -1664,6 +1750,497 @@ def _build_quiz_suggestions(node_id: str, domain_id: str, conn) -> list[dict]:
         return []
 
 
+# ── Entity-keyed question generation (Phase 1 of entity-first architecture) ─
+# Phase 2 (Session 78) extends question generation with entity-graph context:
+# Wikidata structured properties, scoped temporal neighbors, voice-capture
+# co-occurrence. All enrichment preserves the invariant that cards reference
+# facts the user has actually captured — Wikidata properties are framed as
+# retrieval prompts ("you captured X reigned Y-Z; who succeeded?"), never
+# as standalone assertions. See research/entity-first-architecture.md.
+
+# Per-type Wikidata property sets. Conservative starter set — extend as we
+# observe which properties produce retention-useful enrichment. Every P-number
+# here is verified (P1365=replaces, P1366=replaced by; the Phase 2 prompt's
+# "P2962" was wrong).
+_WIKIDATA_PROPS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    'person': (
+        'P22',    # father
+        'P25',    # mother
+        'P26',    # spouse
+        'P40',    # child
+        'P27',    # country of citizenship
+        'P19',    # place of birth
+        'P20',    # place of death
+        'P39',    # position held
+        'P106',   # occupation
+        'P569',   # date of birth
+        'P570',   # date of death
+        'P1365',  # replaces (predecessor in position)
+        'P1366',  # replaced by (successor in position)
+    ),
+    'battle': (
+        'P710',   # participant
+        'P276',   # location
+        'P585',   # point in time
+        'P580',   # start time
+        'P582',   # end time
+        'P607',   # conflict (parent war)
+        'P1542',  # has effect / caused by
+    ),
+    'event': (
+        'P710',   # participant
+        'P31',    # instance of
+        'P585',   # point in time
+        'P580',   # start time
+        'P582',   # end time
+        'P276',   # location
+        'P1542',  # has effect
+    ),
+    'place': (
+        'P17',    # country
+        'P131',   # located in administrative territorial entity
+        'P571',   # inception
+        'P576',   # dissolution
+    ),
+    'work': (
+        'P50',    # author
+        'P577',   # publication date
+        'P136',   # genre
+    ),
+}
+
+# Wikidata-props cache freshness: refetch after this many days.
+_WIKIDATA_PROPS_TTL_DAYS = 90
+
+
+def _fetch_wikidata_props(qid: str, entity_type: str | None) -> dict:
+    """Fetch structured Wikidata properties for an entity.
+
+    Returns {"P22": [{"qid": "Q...", "label": "..."}, ...], "P569": [{"time": "+1682-..."}], ...}
+    Property types are one of:
+    - wikibase-item   → {"qid", "label"}  (requires a secondary get_many to resolve labels)
+    - time            → {"time"} raw Wikidata string
+    - external-id     → {"value"}
+    - string          → {"value"}
+
+    Returns {} on any failure (no QID, network error, etc.). Never raises.
+    """
+    if not qid:
+        return {}
+    try:
+        from limbic.amygdala.wikidata import WikidataClient
+    except ImportError:
+        return {}
+
+    # Look up props for the given type. For unknown/legacy types (e.g. the
+    # literal 'entity' fallback used before Session 77's classifier fix), fetch
+    # the UNION of all property sets. Most won't apply to the entity — they
+    # just return empty lists — but this avoids missing battle/event props
+    # when the type label is stale.
+    type_key = (entity_type or '').lower()
+    props_to_fetch = _WIKIDATA_PROPS_BY_TYPE.get(type_key)
+    if props_to_fetch is None:
+        all_props: set[str] = set()
+        for ps in _WIKIDATA_PROPS_BY_TYPE.values():
+            all_props.update(ps)
+        props_to_fetch = tuple(sorted(all_props))
+
+    try:
+        client = WikidataClient(user_agent="Petrarca/0.1 (mailto:stian@haklev.com)")
+        entity = client.get(qid)
+        if entity is None:
+            return {}
+
+        result: dict[str, list[dict]] = {}
+        qids_needing_labels: set[str] = set()
+
+        for prop in props_to_fetch:
+            statements = entity.claims.get(prop, [])
+            if not statements:
+                continue
+            values = []
+            for stmt in statements:
+                if stmt.get('rank') == 'deprecated':
+                    continue
+                mainsnak = stmt.get('mainsnak') or {}
+                dtype = mainsnak.get('datatype')
+                dv = (mainsnak.get('datavalue') or {}).get('value')
+                if dv is None:
+                    continue
+                if dtype == 'wikibase-item' and isinstance(dv, dict) and 'id' in dv:
+                    values.append({'qid': dv['id']})
+                    qids_needing_labels.add(dv['id'])
+                elif dtype == 'time' and isinstance(dv, dict):
+                    values.append({'time': dv.get('time', '')})
+                elif dtype == 'external-id':
+                    values.append({'value': dv})
+                elif isinstance(dv, str):
+                    values.append({'value': dv})
+            if values:
+                result[prop] = values
+
+        # Second pass: resolve labels for referenced QIDs
+        if qids_needing_labels:
+            label_entities = client.get_many(list(qids_needing_labels))
+            for prop, values in result.items():
+                for v in values:
+                    ref_qid = v.get('qid')
+                    if ref_qid and ref_qid in label_entities:
+                        lbl = label_entities[ref_qid].label('en')
+                        if lbl:
+                            v['label'] = lbl
+
+        return result
+    except Exception as e:
+        print(f'[entity-q] wikidata props fetch failed for {qid}: {e}', flush=True)
+        return {}
+
+
+def _get_or_fetch_entity_props(ke_row: dict, conn) -> dict:
+    """Return cached Wikidata props, refetching if absent or stale.
+
+    Reads `wikidata_props_json` from the knowledge_entities row. If missing,
+    stale (> TTL), or empty, hits Wikidata and caches the fresh result via
+    a separate short write transaction. Returns just the {"P..": [...]} dict,
+    not the full cache envelope.
+    """
+    cached_raw = ke_row.get('wikidata_props_json')
+    if cached_raw:
+        try:
+            cached = json.loads(cached_raw)
+            fetched_at = cached.get('fetched_at', 0)
+            age_days = (time.time() - fetched_at) / 86400.0
+            if age_days < _WIKIDATA_PROPS_TTL_DAYS and cached.get('props'):
+                return cached['props']
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    qid = ke_row.get('wikidata_qid')
+    if not qid:
+        return {}
+
+    # Release any existing read lock before network I/O
+    props = _fetch_wikidata_props(qid, ke_row.get('entity_type'))
+    if not props:
+        return {}
+
+    # Short write transaction — LLM calls haven't run yet
+    envelope = {'fetched_at': int(time.time()), 'props': props}
+    try:
+        from db import get_connection
+        wconn = get_connection()
+        wconn.execute(
+            'UPDATE knowledge_entities SET wikidata_props_json=? WHERE id=?',
+            (json.dumps(envelope), ke_row['id']),
+        )
+        wconn.commit()
+        wconn.close()
+    except Exception as e:
+        print(f'[entity-q] failed to cache wikidata props for {ke_row.get("id")}: {e}',
+              flush=True)
+
+    return props
+
+
+def _get_scoped_temporal_neighbors(
+    entity_id: str | None, qid: str | None,
+    date_start: int | None, date_end: int | None,
+    conn, window_years: int = 50, limit: int = 5,
+) -> list[dict]:
+    """Find entities in the user's own graph with overlapping date ranges.
+
+    Scope: `shared_entities` rows that are either (a) keyed in
+    `knowledge_entities`, or (b) linked via `entity_curriculum_links` to a
+    `knowledge_items` row the user has seen. Excludes the entity itself.
+
+    Returns list of dicts: [{"name", "description", "date_start", "date_end",
+    "entity_type", "source"}]. `source` is 'entity' or 'curriculum'. Sorted
+    by temporal proximity (closest date_start first).
+    """
+    if date_start is None and date_end is None:
+        return []
+    ds = date_start if date_start is not None else date_end
+    de = date_end if date_end is not None else date_start
+    window_lo = (ds or 0) - window_years
+    window_hi = (de or 0) + window_years
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT se.entity_id, se.name, se.description, se.entity_type,
+                   se.date_start, se.date_end,
+                   CASE
+                       WHEN EXISTS (SELECT 1 FROM knowledge_entities ke2
+                                    WHERE ke2.entity_id = se.entity_id)
+                       THEN 'entity'
+                       ELSE 'curriculum'
+                   END AS source
+            FROM shared_entities se
+            WHERE se.date_start IS NOT NULL
+              AND se.date_end IS NOT NULL
+              AND se.date_start <= ?
+              AND se.date_end >= ?
+              AND (se.entity_id != ? OR ? IS NULL)
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM knowledge_entities ke
+                      WHERE ke.entity_id = se.entity_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM entity_curriculum_links ecl
+                      JOIN knowledge_items ki
+                          ON ki.curriculum_domain = ecl.domain_id
+                         AND ki.curriculum_node_id = ecl.node_id
+                      WHERE ecl.entity_id = se.entity_id
+                  )
+              )
+            ORDER BY ABS(se.date_start - ?) ASC
+            LIMIT ?
+            """,
+            (window_hi, window_lo, entity_id, entity_id, ds or 0, limit),
+        ).fetchall()
+    except Exception as e:
+        print(f'[entity-q] temporal-neighbor query failed: {e}', flush=True)
+        return []
+
+    return [dict(r) for r in rows]
+
+
+def _get_voice_cooccurring_entities(
+    entity_name: str, conn, limit: int = 3,
+) -> list[dict]:
+    """Entities most frequently mentioned alongside this one in voice captures.
+
+    Walks `voice_transcripts.llm_result.entities_mentioned`. For each
+    transcript that mentions this entity, tally all OTHER entities in the
+    same list. Return top-N by count.
+
+    Uses simple name matching (case-insensitive substring) because
+    entity_name is what the LLM extracted — not necessarily a QID.
+    """
+    if not entity_name:
+        return []
+
+    target = entity_name.strip().lower()
+    counts: dict[str, int] = {}
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT llm_result FROM voice_transcripts
+            WHERE llm_result IS NOT NULL
+              AND llm_result LIKE ?
+            """,
+            (f'%{entity_name}%',),
+        ).fetchall()
+    except Exception as e:
+        print(f'[entity-q] co-occurrence query failed: {e}', flush=True)
+        return []
+
+    for r in rows:
+        try:
+            lr = json.loads(r['llm_result']) if r['llm_result'] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        mentioned = lr.get('entities_mentioned') or []
+        if not isinstance(mentioned, list):
+            continue
+        names = [str(m).strip() for m in mentioned if m]
+        # Did this transcript actually mention our target?
+        if not any(target == n.lower() or target in n.lower() for n in names):
+            continue
+        for n in names:
+            if n.lower() == target or target in n.lower():
+                continue
+            counts[n] = counts.get(n, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:limit]
+    return [{'name': n, 'count': c} for n, c in ranked]
+
+
+def _format_entity_graph_context(
+    entity_name: str,
+    props: dict,
+    neighbors: list[dict],
+    cooccur: list[dict],
+) -> str:
+    """Render entity-graph context into a prompt-ready text block.
+
+    Returns empty string when nothing to say — the prompt template then
+    just emits a blank line rather than a labeled-but-empty section.
+    """
+    blocks: list[str] = []
+
+    # --- Wikidata structured properties ---
+    prop_lines: list[str] = []
+    _HUMAN_LABEL = {
+        'P22': 'father',
+        'P25': 'mother',
+        'P26': 'spouse',
+        'P40': 'child',
+        'P27': 'citizenship',
+        'P19': 'birthplace',
+        'P20': 'place of death',
+        'P31': 'type',
+        'P39': 'position held',
+        'P106': 'occupation',
+        'P569': 'born',
+        'P570': 'died',
+        'P1365': 'succeeded',   # this entity replaces X
+        'P1366': 'succeeded by',  # this entity replaced by X
+        'P710': 'participants',
+        'P276': 'location',
+        'P585': 'date',
+        'P580': 'start',
+        'P582': 'end',
+        'P607': 'part of war',
+        'P1542': 'consequence',
+        'P17': 'country',
+        'P131': 'located in',
+        'P571': 'founded',
+        'P576': 'dissolved',
+        'P50': 'author',
+        'P577': 'published',
+        'P136': 'genre',
+    }
+
+    def _fmt_value(v: dict) -> str:
+        if 'label' in v:
+            return v['label']
+        if 'qid' in v:
+            return v['qid']
+        if 'time' in v:
+            t = v['time'] or ''
+            sign = '-' if t.startswith('-') else ''
+            year_part = t.lstrip('+-').split('-')[0]
+            return f'{sign}{year_part}' if year_part else t
+        return str(v.get('value', ''))
+
+    for prop, values in props.items():
+        label = _HUMAN_LABEL.get(prop, prop)
+        rendered = [_fmt_value(v) for v in values[:5]]
+        # Dedup while preserving order (Julian/Gregorian calendar dupes etc.)
+        seen: set[str] = set()
+        unique_rendered = []
+        for r in rendered:
+            if r and r not in seen:
+                seen.add(r)
+                unique_rendered.append(r)
+        if unique_rendered:
+            prop_lines.append(f'- {label}: {", ".join(unique_rendered[:3])}')
+    if prop_lines:
+        blocks.append('Wikidata properties for ' + entity_name + ':\n' + '\n'.join(prop_lines))
+
+    # --- Temporal neighbors (scoped) ---
+    if neighbors:
+        lines = []
+        for n in neighbors[:5]:
+            dates = ''
+            if n.get('date_start') is not None and n.get('date_end') is not None:
+                ds = n['date_start']
+                de = n['date_end']
+                dates = f' ({ds}–{de})' if ds != de else f' ({ds})'
+            desc = (n.get('description') or '')[:80]
+            lines.append(f'- {n["name"]}{dates}: {desc}'.rstrip(': '))
+        blocks.append("Other entities you've captured from the same period:\n" + '\n'.join(lines))
+
+    # --- Voice-capture co-occurrence ---
+    if cooccur:
+        lines = [f'- {c["name"]} (mentioned together in {c["count"]} capture{"s" if c["count"] != 1 else ""})'
+                 for c in cooccur]
+        blocks.append("Entities you've discussed alongside " + entity_name + ':\n' + '\n'.join(lines))
+
+    return '\n\n'.join(blocks)
+
+
+def generate_entity_question(ke_id: str, conn) -> dict:
+    """Generate a review question for a knowledge_entities item.
+
+    Phase 1: uses `_key_fact_to_question` with entity_name/desc substituted.
+    Phase 2: additionally enriches the LLM prompt with entity-graph context
+    (Wikidata props + scoped temporal neighbors + voice co-occurrence). The
+    enrichment context is passed to `_key_fact_to_question` via its
+    optional `entity_graph_context` parameter. No curriculum context.
+    """
+    row = conn.execute('SELECT * FROM knowledge_entities WHERE id=?', (ke_id,)).fetchone()
+    if not row:
+        return {}
+    item = dict(row)
+
+    try:
+        key_facts = json.loads(item.get('key_facts') or '[]')
+    except (json.JSONDecodeError, TypeError):
+        key_facts = []
+    if not key_facts:
+        return {}
+
+    try:
+        question_history = json.loads(item.get('question_history') or '[]')
+    except (json.JSONDecodeError, TypeError):
+        question_history = []
+
+    fact = _pick_key_fact(key_facts, question_history)
+    if not fact:
+        # All facts tested — rotate back to the first one for continued drilling
+        fact = key_facts[0]
+
+    entity_name = item.get('entity_name') or ''
+    entity_desc = ''
+    entity_date_start = None
+    entity_date_end = None
+    # Pull description + dates from shared_entities if linked (post Wikidata resolution)
+    if item.get('entity_id'):
+        try:
+            se_row = conn.execute(
+                'SELECT description, date_start, date_end FROM shared_entities WHERE entity_id=?',
+                (item['entity_id'],)
+            ).fetchone()
+            if se_row:
+                if se_row['description']:
+                    entity_desc = se_row['description']
+                entity_date_start = se_row['date_start']
+                entity_date_end = se_row['date_end']
+        except Exception:
+            pass
+
+    # --- Phase 2: entity-graph context ---
+    # Assemble enrichment BEFORE the LLM call. All three sources degrade
+    # gracefully to empty on missing QID / missing dates / DB errors.
+    props = _get_or_fetch_entity_props(item, conn) if item.get('wikidata_qid') else {}
+    neighbors = _get_scoped_temporal_neighbors(
+        item.get('entity_id'), item.get('wikidata_qid'),
+        entity_date_start, entity_date_end, conn,
+    )
+    cooccur = _get_voice_cooccurring_entities(entity_name, conn)
+    entity_graph_context = _format_entity_graph_context(
+        entity_name, props, neighbors, cooccur,
+    )
+
+    result = _key_fact_to_question(
+        fact, entity_name, entity_desc,
+        conn=None, node_id=None, domain_id=None,
+        entity_graph_context=entity_graph_context,
+    )
+
+    # Generate sideways follow-up queries (Gemini Flash) so entity cards get
+    # the same "Also explore…" chips as curriculum cards.
+    # See research/session-77-observations.md Gap A.
+    try:
+        fact_ctx = f"{fact.get('question', '')} — {fact.get('answer', '')}"
+        follow_ups = _generate_follow_up_queries(
+            node_title=entity_name,
+            node_description=entity_desc,
+            fact_context=fact_ctx,
+            conn=None, node_id=None, domain_id=None,
+        )
+        if follow_ups:
+            result['follow_up_queries'] = follow_ups
+    except Exception as e:
+        print(f'[entity-q] follow-up gen failed for {entity_name}: {e}', flush=True)
+
+    return result
+
+
 # ── Multi-cue quiz generation ────────────────────────────────────────────────
 
 MULTICUE_PROMPT = """Generate 2-4 retrieval cue questions for each historical fact. These are alternate quiz angles for the SAME fact — like flashcard reversals for dates, battles, people, conquests.
@@ -1830,7 +2407,7 @@ def generate_multicue_quizzes(node_id: str, domain_id: str):
 
 def record_answer(item_id: str, score: str, conn) -> dict:
     # Look up in knowledge_items first; fall back to review_items,
-    # then microlearning_quizzes, then microlearning_cards (legacy)
+    # then microlearning_quizzes, then knowledge_entities, then microlearning_cards
     row = conn.execute('SELECT * FROM knowledge_items WHERE id=?', (item_id,)).fetchone()
     table = 'knowledge_items'
     if row is None:
@@ -1841,6 +2418,13 @@ def record_answer(item_id: str, score: str, conn) -> dict:
             row = conn.execute('SELECT * FROM microlearning_quizzes WHERE id=?', (item_id,)).fetchone()
             if row:
                 table = 'microlearning_quizzes'
+        except Exception:
+            pass
+    if row is None:
+        try:
+            row = conn.execute('SELECT * FROM knowledge_entities WHERE id=?', (item_id,)).fetchone()
+            if row:
+                table = 'knowledge_entities'
         except Exception:
             pass
     if row is None:
@@ -1948,8 +2532,43 @@ def record_answer(item_id: str, score: str, conn) -> dict:
 
     conn.commit()
 
+    # ── Leech detection: auto-suspend items with 7+ consecutive misses ───
+    leech_suspended = False
+    if score == 'missed' and (item.get('review_count') or 0) >= 5:
+        try:
+            recent = conn.execute("""
+                SELECT score FROM interaction_log
+                WHERE item_id=? AND score IN ('knew', 'partly', 'missed')
+                  AND event IN ('review_answer', 'review_result', 'review_quiz_result')
+                ORDER BY created_at DESC LIMIT 7
+            """, (item_id,)).fetchall()
+            consecutive_misses = 0
+            for r in recent:
+                if r['score'] == 'missed':
+                    consecutive_misses += 1
+                else:
+                    break
+            if consecutive_misses >= 7:
+                # Auto-suspend for 30 days
+                suspend_until = now + 30 * 24 * 60 * 60 * 1000
+                conn.execute(
+                    f'UPDATE {table} SET due_at=?, cached_question=NULL WHERE id=?',
+                    (suspend_until, item_id))
+                conn.commit()
+                leech_suspended = True
+                print(f'[leech] auto-suspended {item_id} ({consecutive_misses} consecutive misses)', flush=True)
+                try:
+                    from server_log import log_interaction
+                    log_interaction('leech_suspended', item_id=item_id,
+                                    item_type=table, consecutive_misses=consecutive_misses)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f'[leech] detection error for {item_id}: {e}', flush=True)
+
     # Background re-generation — pre-cache question for next session (not for microlearning)
-    if table != 'microlearning_cards':
+    # For leeches, regeneration happens on unsuspend
+    if table != 'microlearning_cards' and not leech_suspended:
         def _regen():
             try:
                 from db import get_connection as _conn
@@ -1971,7 +2590,10 @@ def record_answer(item_id: str, score: str, conn) -> dict:
         threading.Thread(target=generate_multicue_quizzes,
                          args=(_node_id, _domain_id), daemon=True).start()
 
-    return {'next_due_at': next_due, 'new_stability_days': new_stability}
+    result = {'next_due_at': next_due, 'new_stability_days': new_stability}
+    if leech_suspended:
+        result['leech_suspended'] = True
+    return result
 
 
 # ── Structural card grading ──────────────────────────────────────────────────
@@ -2036,6 +2658,52 @@ def record_structural_answer(card_id: str, results: list, conn) -> dict:
         })
         print(f'[structural] {pos_id}: {score} → stability={new_stability:.1f}d due={new_card.due.strftime("%m-%d")}', flush=True)
 
+    # ── Collateral exposure: credit anchor positions (visible but not tested) ──
+    graded_ids = {r.get('position_id') for r in results if r.get('position_id')}
+    anchor_rows = conn.execute(
+        'SELECT id, fsrs_card_json, stability_days FROM structural_positions '
+        'WHERE card_id=? AND id NOT IN ({})'.format(
+            ','.join('?' for _ in graded_ids)
+        ),
+        (card_id, *graded_ids)
+    ).fetchall() if graded_ids else []
+
+    collateral_count = 0
+    for ar in anchor_rows:
+        anchor_id = ar['id']
+        card_json = ar['fsrs_card_json']
+        if card_json:
+            card_data = json.loads(card_json) if isinstance(card_json, str) else card_json
+            card = FsrsCard.from_dict(card_data)
+        else:
+            card = FsrsCard()
+
+        # Apply Good rating for passive exposure
+        new_card, _ = _fsrs_scheduler.review_card(card, FsrsRating.Good, now_dt)
+        # Scale stability gain to ~30% of a full review
+        old_stability = card.stability or 1.0
+        full_gain = (new_card.stability or 1.0) - old_stability
+        reduced_stability = old_stability + full_gain * 0.3
+        new_card_dict = new_card.to_dict()
+        new_card_dict['stability'] = reduced_stability
+        next_due = int((now_dt.timestamp() + reduced_stability * 86400) * 1000)
+
+        conn.execute("""
+            UPDATE structural_positions
+            SET stability_days=?, due_at=?, fsrs_card_json=?
+            WHERE id=?
+        """, (reduced_stability, next_due, json.dumps(new_card_dict), anchor_id))
+        collateral_count += 1
+
+    if collateral_count > 0:
+        print(f'[structural] {collateral_count} anchor positions got collateral exposure credit', flush=True)
+        try:
+            from server_log import log_interaction
+            log_interaction('collateral_exposure', card_id=card_id,
+                            card_type='structural', count=collateral_count)
+        except Exception:
+            pass
+
     # Update card-level review count
     conn.execute(
         'UPDATE structural_cards SET review_count=review_count+1 WHERE id=?',
@@ -2069,6 +2737,7 @@ def record_structural_answer(card_id: str, results: list, conn) -> dict:
         'positions': position_results,
         'knew': knew,
         'total': len(position_results),
+        'collateral_count': collateral_count,
     }
 
 
@@ -4541,12 +5210,14 @@ def process_voice_capture(transcript: str, entity_id: str = None,
     conn.close()
 
     if not candidate_nodes:
-        print(f'[voice-capture] No candidate nodes found for entity={entity_id}, mode={mode}', flush=True)
-        return {
-            'error': 'no_curriculum_match',
-            'transcript': transcript,
-            'message': 'Could not find relevant curriculum nodes for this capture.',
-        }
+        print(f'[voice-capture] No candidate nodes — routing to entity path', flush=True)
+        return _process_voice_capture_entity_path(
+            transcript=transcript,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            detected_entity_ids=detected_entity_ids,
+            sync=sync,
+        )
 
     # Sort: direct links first, then siblings by overlap, then domain fillers
     priority_order = {'direct': 0, 'sibling': 1, 'routed': 2, 'domain': 3, 'keyword': 4}
@@ -4888,30 +5559,33 @@ def process_voice_capture(transcript: str, entity_id: str = None,
         except Exception as e:
             print(f'[voice-capture→ml] failed: {e}', flush=True)
 
-    # --- Fallback: when no nodes matched, create ML cards from extracted facts ---
-    # This ensures voice captures about novel topics (outside all curricula) still
-    # produce reviewable content rather than being silently lost.
-    if not node_assessments and facts:
-        summary = analysis.get('overall_summary', '')
-        topic = summary[:100] if summary else (entity_name or 'voice capture')
-        for f in facts[:5]:
-            fact_text = f.get('fact', '') if isinstance(f, dict) else str(f)
-            if not fact_text or len(fact_text) < 10:
-                continue
-            query = f'From voice capture about {topic}: {fact_text}'
-            try:
-                card_id = create_microlearning_request(
-                    query=query,
-                    source_node_id=primary_node,
-                    source_domain=primary_domain,
-                    source_type='voice_capture',
-                )
-                ml_triggered.append({'id': card_id, 'query': fact_text[:80]})
-                print(f'[voice-capture→ml] novel-fact → {card_id}: {fact_text[:60]}', flush=True)
-            except Exception as e:
-                print(f'[voice-capture→ml] novel-fact failed: {e}', flush=True)
-        if ml_triggered:
-            print(f'[voice-capture] Novel topic: created {len(ml_triggered)} ML cards from extracted facts', flush=True)
+    # --- Fallback: when no nodes matched but the capture has real content,
+    # route to the entity path. The curriculum LLM pass found no real match
+    # (Gemini domain routing / keyword matching produced candidate nodes, but
+    # the analysis LLM correctly rejected them). Entity path runs its own LLM
+    # call with VOICE_CAPTURE_ENTITY_PROMPT to produce properly structured
+    # question/answer facts grouped by entity. See entity-first architecture.
+    entity_path_triggered = False
+    if not node_assessments and (facts or entities_mentioned):
+        print(f'[voice-capture] No node assessments despite {len(facts)} facts — '
+              f'routing to entity path', flush=True)
+        entity_result = _process_voice_capture_entity_path(
+            transcript=transcript,
+            entity_id=entity_id,
+            entity_name=entity_name,
+            detected_entity_ids=detected_entity_ids,
+            sync=sync,
+        )
+        entity_path_triggered = True
+        # Surface the entity-path outcome in the curriculum-path response
+        # so the client sees entity items were created.
+        result_addendum = {
+            'entity_path_triggered': True,
+            'entity_items_created': entity_result.get('entity_items_created', 0),
+            'entity_items_updated': entity_result.get('entity_items_updated', 0),
+            'knowledge_entities': entity_result.get('knowledge_entities', []),
+        }
+        ml_triggered.extend(entity_result.get('microlearning_triggered', []))
 
     # --- Log transcript ---
     vt_row = _log_voice_transcript(
@@ -4926,7 +5600,11 @@ def process_voice_capture(transcript: str, entity_id: str = None,
     )
 
     # --- Background: resolve entities to Wikidata QIDs ---
-    if entities_mentioned:
+    # Skip when the entity path already fired its own resolution thread,
+    # otherwise every mention is resolved twice (doubling API/LLM cost
+    # and producing racing INSERTs on shared_entities). See
+    # research/session-77-observations.md Bug 1.
+    if entities_mentioned and not entity_path_triggered:
         capture_id = vt_row if isinstance(vt_row, str) else 'unknown'
         # Only pass assessed nodes for linking (not the full candidate list)
         assessed_node_map = {na.get('node_id', ''): node_domain_map.get(na.get('node_id', ''), '')
@@ -4952,6 +5630,11 @@ def process_voice_capture(transcript: str, entity_id: str = None,
         'microlearning_triggered': ml_triggered,
         'overall_summary': analysis.get('overall_summary', ''),
     }
+    # Merge entity-path addendum if the fallback routed there
+    try:
+        result.update(result_addendum)
+    except NameError:
+        pass  # result_addendum only set when entity path was triggered
 
     # Check if multiple nodes from same era were touched with uncertain dates → timeline card
     if len(node_assessments) >= 2 and primary_domain:
@@ -5011,6 +5694,329 @@ def process_voice_capture(transcript: str, entity_id: str = None,
     print(f'[voice-capture] Done: {len(facts)} facts → {len(knowledge_updates)} nodes, '
           f'{len(ml_triggered)} ML cards', flush=True)
     return result
+
+
+def _process_voice_capture_entity_path(
+    transcript: str,
+    entity_id: str | None,
+    entity_name: str | None,
+    detected_entity_ids: list,
+    sync: bool = False,
+) -> dict:
+    """Process a voice capture via the entity-keyed path (no curriculum required).
+
+    Called from process_voice_capture() when no curriculum nodes match. Creates/
+    updates knowledge_entities rows with facts extracted from the transcript,
+    schedules them via FSRS, triggers ML cards from wonderings, and fires the
+    existing background Wikidata resolution thread.
+
+    See research/entity-first-architecture.md.
+    """
+    from db import get_connection
+
+    # Gather context for known entities (if any were detected by name matching)
+    conn = get_connection(readonly=True)
+    entity_context_lines = []
+    known_entities = {}  # name → shared_entities row
+    for eid in detected_entity_ids[:8]:
+        row = conn.execute(
+            '''SELECT entity_id, name, description, entity_type,
+                      date_start, date_end, wikidata_qid
+               FROM shared_entities WHERE entity_id=?''',
+            (eid,)
+        ).fetchone()
+        if not row:
+            continue
+        known_entities[row['name']] = dict(row)
+        desc = (row['description'] or '')[:150]
+        dates = ''
+        if row['date_start'] is not None:
+            end = row['date_end'] if row['date_end'] is not None else row['date_start']
+            dates = f" ({row['date_start']}–{end})"
+        entity_context_lines.append(
+            f"- {row['name']}{dates} [{row['entity_type'] or 'entity'}]: {desc}"
+        )
+    conn.close()
+
+    if entity_id and entity_name:
+        context_section = f'CONTEXT: The learner is speaking about {entity_name}.'
+    elif entity_name:
+        context_section = f'CONTEXT: The learner appears to be discussing {entity_name}.'
+    else:
+        context_section = 'CONTEXT: The learner is sharing knowledge from a podcast, book, or personal study. No curriculum structure exists yet for this topic.'
+
+    entity_info = (
+        'KNOWN ENTITIES (already in the knowledge base — use these names verbatim if they appear):\n'
+        + '\n'.join(entity_context_lines)
+    ) if entity_context_lines else 'KNOWN ENTITIES: (none yet — this is a new topic)'
+
+    prompt = VOICE_CAPTURE_ENTITY_PROMPT.format(
+        context_section=context_section,
+        entity_info=entity_info,
+        transcript=transcript,
+    )
+
+    analysis = call_claude_json(prompt, timeout=180)
+    if not isinstance(analysis, dict):
+        print(f'[voice-capture-entity] LLM returned non-dict: {repr(str(analysis)[:200])}', flush=True)
+        analysis = {}
+
+    entity_facts = analysis.get('entity_facts', {}) or {}
+    entity_types = analysis.get('entity_types', {}) or {}
+    wonderings = analysis.get('wonderings', []) or []
+    entities_mentioned = analysis.get('entities_mentioned', []) or []
+    confidence_tagged = analysis.get('confidence_tagged', []) or []
+    overall_summary = analysis.get('overall_summary', '')
+
+    print(
+        f'[voice-capture-entity] Analysis: {sum(len(v) for v in entity_facts.values())} facts '
+        f'across {len(entity_facts)} entities, {len(wonderings)} wonderings',
+        flush=True,
+    )
+
+    # --- DB writes: create/update knowledge_entities rows ---
+    now_ms = int(time.time() * 1000)
+    vt_id = f'vt_{int(time.time())}_{hash(transcript) % 10000:04d}'
+    items_created = 0
+    items_updated = 0
+    ke_ids_created: list[str] = []
+
+    def _slugify(name: str) -> str:
+        s = re.sub(r'\W+', '_', name.lower()).strip('_')
+        return s or 'entity'
+
+    max_write_attempts = 3
+    for attempt in range(max_write_attempts):
+        try:
+            conn = get_connection()
+            conn.execute('PRAGMA busy_timeout = 60000')
+
+            for ent_name, facts in entity_facts.items():
+                if not ent_name or not facts:
+                    continue
+                ent_name = ent_name.strip()
+                slug = _slugify(ent_name)
+                ke_id = f'ent:{slug}'
+
+                # Normalize incoming facts to the key_facts schema
+                normalized_facts = []
+                for i, f in enumerate(facts):
+                    if not isinstance(f, dict):
+                        continue
+                    q = (f.get('question') or '').strip()
+                    a = (f.get('answer') or '').strip()
+                    if not q or not a:
+                        continue
+                    normalized_facts.append({
+                        'id': f.get('id') or f'vc_{int(time.time())}_{i}',
+                        'question': q,
+                        'answer': a,
+                        'type': f.get('type') or 'event',
+                        'source_excerpt': f.get('source_excerpt') or '',
+                    })
+                if not normalized_facts:
+                    continue
+
+                # Link to shared_entities if already known
+                se = known_entities.get(ent_name)
+                linked_entity_id = se.get('entity_id') if se else None
+                linked_qid = se.get('wikidata_qid') if se else None
+                # Prefer an already-known type from shared_entities; fall back
+                # to the LLM's classification; last resort is the generic
+                # 'entity' sentinel. See research/session-77-observations.md Gap B.
+                ent_type = (
+                    (se.get('entity_type') if se else None)
+                    or entity_types.get(ent_name)
+                    or 'entity'
+                )
+
+                new_source = {
+                    'source': 'voice_capture',
+                    'capture_id': vt_id,
+                    'source_text': overall_summary[:400],
+                    'added_at': now_ms,
+                }
+
+                existing = conn.execute(
+                    'SELECT key_facts, sources FROM knowledge_entities WHERE id=?',
+                    (ke_id,)
+                ).fetchone()
+                if existing:
+                    try:
+                        prior_facts = json.loads(existing['key_facts'] or '[]')
+                    except (json.JSONDecodeError, TypeError):
+                        prior_facts = []
+                    try:
+                        prior_sources = json.loads(existing['sources'] or '[]')
+                    except (json.JSONDecodeError, TypeError):
+                        prior_sources = []
+
+                    # Dedup by question text (case-insensitive)
+                    existing_qs = {
+                        (pf.get('question') or '').lower().strip() for pf in prior_facts
+                    }
+                    merged_facts = list(prior_facts)
+                    for nf in normalized_facts:
+                        if nf['question'].lower().strip() not in existing_qs:
+                            merged_facts.append(nf)
+                            existing_qs.add(nf['question'].lower().strip())
+
+                    conn.execute(
+                        '''UPDATE knowledge_entities
+                           SET key_facts=?, sources=?, cached_question=NULL
+                           WHERE id=?''',
+                        (
+                            json.dumps(merged_facts),
+                            json.dumps(prior_sources + [new_source]),
+                            ke_id,
+                        ),
+                    )
+                    items_updated += 1
+                    ke_ids_created.append(ke_id)
+                else:
+                    conn.execute(
+                        '''INSERT INTO knowledge_entities
+                           (id, entity_id, entity_name, entity_type, wikidata_qid,
+                            key_facts, sources, stability_days, due_at, review_count,
+                            created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, ?, 0, ?)''',
+                        (
+                            ke_id, linked_entity_id, ent_name, ent_type, linked_qid,
+                            json.dumps(normalized_facts),
+                            json.dumps([new_source]),
+                            now_ms, now_ms,
+                        ),
+                    )
+                    items_created += 1
+                    ke_ids_created.append(ke_id)
+
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            if 'locked' in str(e).lower() and attempt < max_write_attempts - 1:
+                wait = 5 * (attempt + 1)
+                print(f'[voice-capture-entity] DB locked, retry in {wait}s', flush=True)
+                time.sleep(wait)
+                continue
+            raise
+
+    # --- Pre-generate cached questions in the background ---
+    # Follows the CLAUDE.md write-lock discipline: read → close → slow Claude
+    # work → open → write. Never hold a connection during the LLM call, and
+    # never share a conn across entities (ML research threads are also writing).
+    if ke_ids_created:
+        def _pregen_entity_questions():
+            from db import get_connection as _gc
+            generated = 0
+            for kid in ke_ids_created:
+                try:
+                    # Read (no lock held beyond this block)
+                    c = _gc(readonly=True)
+                    row = c.execute(
+                        'SELECT cached_question FROM knowledge_entities WHERE id=?',
+                        (kid,),
+                    ).fetchone()
+                    c.close()
+                    if not row or row['cached_question']:
+                        continue
+
+                    # Slow Claude call — fresh readonly conn, no dirty state
+                    rc = _gc(readonly=True)
+                    try:
+                        q = generate_entity_question(kid, rc)
+                    finally:
+                        rc.close()
+                    if not q:
+                        continue
+
+                    # Fast write — fresh conn, single UPDATE, commit, close
+                    wc = _gc()
+                    try:
+                        wc.execute(
+                            'UPDATE knowledge_entities SET cached_question=? WHERE id=?',
+                            (json.dumps(q), kid),
+                        )
+                        wc.commit()
+                    finally:
+                        wc.close()
+                    generated += 1
+                except Exception as e:
+                    print(f'[voice-capture-entity] pre-gen failed {kid}: {e}', flush=True)
+            print(
+                f'[voice-capture-entity] Pre-generated {generated}/{len(ke_ids_created)} questions',
+                flush=True,
+            )
+
+        if sync:
+            _pregen_entity_questions()
+        else:
+            threading.Thread(target=_pregen_entity_questions, daemon=True).start()
+
+    # --- Trigger ML cards from wonderings (entity-tagged, no curriculum domain) ---
+    ml_triggered = []
+    primary_entity_slug = ke_ids_created[0].split(':', 1)[1] if ke_ids_created else None
+    for w in wonderings[:5]:
+        try:
+            card_id = create_microlearning_request(
+                query=w,
+                source_node_id=primary_entity_slug,
+                source_domain=None,
+                source_type='voice_wondering',
+            )
+            ml_triggered.append({'id': card_id, 'query': w})
+            print(f'[voice-capture-entity→ml] wondering → {card_id}: {w[:60]}', flush=True)
+        except Exception as e:
+            print(f'[voice-capture-entity→ml] failed: {e}', flush=True)
+
+    # --- Log the transcript ---
+    llm_result = {
+        'entity_facts': entity_facts,
+        'entity_types': entity_types,
+        'wonderings': wonderings,
+        'entities_mentioned': entities_mentioned,
+        'confidence_tagged': confidence_tagged,
+        'overall_summary': overall_summary,
+        'knowledge_entities_created': items_created,
+        'knowledge_entities_updated': items_updated,
+    }
+    # Prefer the LLM's primary entity over whatever loose name match the
+    # curriculum-path carried in — otherwise the transcript row shows
+    # unrelated curriculum titles (e.g. "1693 Earthquake" for a Karl XII
+    # capture). See research/session-77-observations.md Bug 2.
+    primary_entity_name = next(iter(entity_facts.keys()), None) if entity_facts else None
+    _log_voice_transcript(
+        source='voice_capture_entity',
+        node_id=primary_entity_slug or 'entity',
+        domain_id='',
+        node_title=primary_entity_name or entity_name or 'voice capture',
+        transcript=transcript,
+        audio_bytes=0,
+        llm_result=llm_result,
+        ml_triggered=ml_triggered,
+        vt_id=vt_id,
+    )
+
+    # --- Background Wikidata resolution for mentioned entities ---
+    if entities_mentioned:
+        threading.Thread(
+            target=_resolve_voice_entities_background,
+            args=(entities_mentioned, transcript, vt_id, {}),
+            daemon=True,
+        ).start()
+
+    return {
+        'status': 'completed',
+        'transcript': transcript,
+        'path': 'entity',
+        'entity_items_created': items_created,
+        'entity_items_updated': items_updated,
+        'knowledge_entities': ke_ids_created,
+        'wonderings': wonderings,
+        'entities_mentioned': entities_mentioned,
+        'microlearning_triggered': ml_triggered,
+        'overall_summary': overall_summary,
+    }
 
 
 def _resolve_voice_entities_background(entities_mentioned: list, transcript: str,
@@ -5083,9 +6089,30 @@ def _resolve_voice_entities_background(entities_mentioned: list, transcript: str
     anchors = dict(existing_anchors)
     resolutions: list[tuple[dict, object]] = []
 
+    def _coerce_year(v) -> int | None:
+        """Gemini occasionally returns years as strings ("1682") despite the
+        prompt asking for raw integers. Coerce to int; None on anything that
+        doesn't parse. Preserves negative years (BCE)."""
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                return int(float(v))
+            except ValueError:
+                return None
+        return None
+
     for m in mentions:
         name = m.get("mention", "")
-        s, e = m.get("date_start"), m.get("date_end")
+        s = _coerce_year(m.get("date_start"))
+        e = _coerce_year(m.get("date_end"))
         date_hint = None
         if s is not None or e is not None:
             if s is None: s = e
@@ -5192,6 +6219,25 @@ def _resolve_voice_entities_background(entities_mentioned: list, transcript: str
             continue
         resolved_count += 1
 
+        # Helper: after resolving/creating a shared_entities row, backfill
+        # any matching knowledge_entities row (created by the entity capture
+        # path before Wikidata resolution ran). This links entity items to
+        # their canonical QID + entity_id for cross-capture merging.
+        def _link_ke(resolved_entity_id: str, qid: str, mention_text: str):
+            try:
+                ke_slug = re.sub(r'\W+', '_', mention_text.lower()).strip('_')
+                ke_id_candidate = f'ent:{ke_slug}'
+                # Match by our slug OR by entity_name exact match
+                conn.execute(
+                    """UPDATE knowledge_entities
+                       SET entity_id = COALESCE(entity_id, ?),
+                           wikidata_qid = COALESCE(wikidata_qid, ?)
+                       WHERE id = ? OR entity_name = ?""",
+                    (resolved_entity_id, qid, ke_id_candidate, mention_text),
+                )
+            except Exception as _e:
+                print(f'[voice-entity-resolve] KE link failed for {mention_text}: {_e}', flush=True)
+
         # Check if QID already exists in shared_entities
         existing = conn.execute(
             "SELECT entity_id FROM shared_entities WHERE wikidata_qid = ?",
@@ -5201,6 +6247,7 @@ def _resolve_voice_entities_background(entities_mentioned: list, transcript: str
             # Update audit row with the existing entity_id
             conn.execute("UPDATE entity_resolutions SET entity_id = ? WHERE id = ?",
                          (existing['entity_id'], rid))
+            _link_ke(existing['entity_id'], res.chosen_qid, mention)
             continue
 
         # Check if there's an entity with same name but no QID
@@ -5216,6 +6263,7 @@ def _resolve_voice_entities_background(entities_mentioned: list, transcript: str
             conn.execute("UPDATE entity_resolutions SET entity_id = ? WHERE id = ?",
                          (existing_by_name['entity_id'], rid))
             print(f'[voice-entity-resolve] Assigned {res.chosen_qid} to existing entity {name_slug}', flush=True)
+            _link_ke(existing_by_name['entity_id'], res.chosen_qid, mention)
             continue
 
         # Create new shared_entity
@@ -5241,6 +6289,7 @@ def _resolve_voice_entities_background(entities_mentioned: list, transcript: str
                 "INSERT OR IGNORE INTO entity_curriculum_links (entity_id, domain_id, node_id) VALUES (?, ?, ?)",
                 (name_slug, domain_id, node_id),
             )
+        _link_ke(name_slug, res.chosen_qid, mention)
         created_count += 1
 
     conn.commit()

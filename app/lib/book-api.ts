@@ -421,11 +421,14 @@ export async function fetchReviewStream(
 export async function recordReviewResult(
   questionId: string,
   result: string,
+  responseTimeMs?: number,
 ): Promise<{ next_due_at?: number; new_stability_days?: number }> {
+  const payload: Record<string, unknown> = { question_id: questionId, result };
+  if (responseTimeMs != null) payload.response_time_ms = responseTimeMs;
   const resp = await fetch(`${RESEARCH_BASE}/curriculum/review/result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question_id: questionId, result }),
+    body: JSON.stringify(payload),
   });
   if (!resp.ok) throw new Error(`Review result failed (${resp.status})`);
   return resp.json();

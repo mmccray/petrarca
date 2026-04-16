@@ -13,6 +13,8 @@ interface AspectPosition {
   mnemonic_type?: string;
   stability_days: number;
   due_at: number;
+  review_count: number;
+  last_score: string | null;
 }
 
 export interface AspectCardData {
@@ -85,6 +87,21 @@ export default function AspectCard({ card, onComplete }: Props) {
   const knewCount = positions.filter(p => states[p.position_id] === 'knew').length;
   const missedPositions = positions.filter(p => states[p.position_id] === 'missed');
 
+  // Trust line: show prior mastery before interaction
+  const masteredCount = positions.filter(
+    p => p.review_count > 0 && p.last_score === 'knew',
+  ).length;
+  const totalReviewed = positions.filter(p => p.review_count > 0).length;
+  const allMastered = masteredCount === positions.length && positions.length > 0;
+  const showTrustLine = totalReviewed > 0;
+
+  // Next due position (future, not overdue) for the trust line
+  const now = Date.now();
+  const futureDue = positions
+    .filter(p => p.due_at > now && p.review_count > 0)
+    .sort((a, b) => a.due_at - b.due_at);
+  const nextDue = futureDue.length > 0 ? futureDue[0] : null;
+
   const animateReveal = (positionId: string) => {
     fadeAnims[positionId].setValue(0);
     Animated.timing(fadeAnims[positionId], {
@@ -148,6 +165,20 @@ export default function AspectCard({ card, onComplete }: Props) {
 
       {/* Title */}
       <Text style={st.title}>{card.title}</Text>
+
+      {/* Trust line: prior mastery context */}
+      {showTrustLine && (
+        <Text style={[st.trustLine, allMastered && st.trustLineGreen]}>
+          {allMastered
+            ? `All ${positions.length} known`
+            : `${masteredCount}/${positions.length} known`}
+          {nextDue
+            ? ` \u00B7 \u2018${nextDue.question_text}\u2019 due ${formatDueDate(nextDue.due_at)}`
+            : allMastered
+              ? ` \u00B7 next review ${formatDueDate(Math.min(...positions.map(p => p.due_at)))}`
+              : ''}
+        </Text>
+      )}
 
       {/* Prompt + Know All */}
       {!allRevealed && (
@@ -259,7 +290,9 @@ const st = StyleSheet.create({
   badge: { backgroundColor: colors.warning, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 2 },
   badgeText: { fontFamily: fonts.uiMedium, fontSize: 10, color: colors.parchment, textTransform: 'uppercase', letterSpacing: 0.5, ...webBold500 },
   domainLabel: { fontFamily: fonts.ui, fontSize: 11, color: colors.textMuted, flex: 1 },
-  title: { fontFamily: fonts.displaySemiBold, fontSize: 20, lineHeight: 26, color: colors.ink, marginBottom: 12, ...webBold600 },
+  title: { fontFamily: fonts.displaySemiBold, fontSize: 20, lineHeight: 26, color: colors.ink, marginBottom: 4, ...webBold600 },
+  trustLine: { fontFamily: fonts.readingItalic, fontSize: 12, color: colors.textMuted, marginBottom: 12, ...webItalic },
+  trustLineGreen: { color: colors.claimNew },
   promptRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   prompt: { fontFamily: fonts.readingItalic, fontSize: 14, color: colors.textSecondary, ...webItalic },
   knowAllBtn: { paddingVertical: 6, paddingHorizontal: 14, borderWidth: 1, borderColor: colors.claimNew, borderRadius: 4, backgroundColor: 'rgba(42,122,74,0.05)' },
